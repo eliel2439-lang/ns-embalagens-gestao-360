@@ -232,6 +232,8 @@ module.exports = async function handler(req, res) {
 
     const action = String(req.body?.action || '');
     const expectedUpdatedAt = normalizeExpectedUpdatedAt(req.body?.expectedUpdatedAt);
+    const clientId = normalizeClientId(req.body?.clientId);
+    const saveId = normalizeSaveId(req.body?.saveId);
     if (action === 'restoreHistory') {
       const historyId = String(req.body?.historyId || '');
       if (!historyId) return json(res, 400, { ok: false, error: 'historyId obrigatório.' });
@@ -240,8 +242,6 @@ module.exports = async function handler(req, res) {
     }
 
     const state = req.body && req.body.state;
-    const clientId = normalizeClientId(req.body?.clientId);
-    const saveId = normalizeSaveId(req.body?.saveId);
 
     if (!state || typeof state !== 'object' || Array.isArray(state)) {
       return json(res, 400, { ok: false, error: 'state obrigatório.' });

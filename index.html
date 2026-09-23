@@ -8,6 +8,7 @@
 <!-- NS UPDATE 2026-09-08 · RELATÓRIO DO DIA / PRODUÇÃO: o Controle de Produção foi incorporado ao PDF do Relatório do Dia, sem criar página nova no sistema. O sistema mantém 7 processos (Riscador, Impressora, Corte e Vinco, Coladeira, Acabamento, Serra e Grampeadeira), com Riscador/Impressora em 9h45 seg–qui e 8h45 sexta; demais em 8h45 seg–qui e 7h45 sexta. O PDF inclui controle diário por processo e matriz mensal de UFs/dia + caixas/h. -->
 <!-- NS FIX 2026-09-16 · BANCO/CAS: POST agora envia expectedUpdatedAt e o backend deve usar compare-and-swap atômico. Conflitos HTTP 409 nunca sobrescrevem: o cliente relê, faz merge e tenta novamente; saveId idempotente evita falso erro após timeout. -->
 <!-- NS UPDATE 2026-09-22 · RELATÓRIO DO DIA: nova página de evolução diária da meta com projeção de fechamento, diferença R$ para o ideal e percentual acima/abaixo do ideal por data. -->
+<!-- NS EMERGENCY 2026-09-23 · RECUPERAÇÃO AUTOMÁTICA: quando Acesso 1 encontra cópia local mais completa que o banco, mescla preservando ambos, restaura via CAS e confirma por GET antes de liberar sincronização. -->
 <!DOCTYPE html>
 <!-- NS FIX 2026-09-11 · RELATÓRIO DO DIA: entregas em janela móvel de 5 dias úteis, espelho canônico do Controle de Entregas e paginação segura de atrasados. -->
 <!-- NS FIX 2026-09-09 · IMPORTAÇÃO RISCADOR XLSX: horários e Tempo Final gravados pelo Excel como frações decimais em células numéricas agora são reconhecidos mesmo após o leitor XLSX convertê-los para texto. O layout real do checklist 2026 com 2 blocos de Ajuste + Produção e coluna NOME sem Total Pessoas é aceito diretamente. -->
@@ -8521,6 +8522,50 @@ async function fetchRemote(){
   if(r?.state&&typeof r.state==='object')nsSyncLog('GET_STATE',{revision:nsMetaRevision(r.state),saveId:nsPendingSaveId(r.state),records:nsRecordCount(r.state),bytes:nsSafeSize(r.state)});
   return r
 }
+async function nsAutoRestoreRicherLocal(chosen,remote,role){
+  if(String(role)!=='1'||!chosen?.state)return{ok:false,reason:'not-admin-or-no-copy'};
+  const remoteState=remote?.exists&&remote?.state&&typeof remote.state==='object'?remote.state:null;
+  const remoteCount=remoteState?nsRecordCount(remoteState):0;
+  const localCount=Number(chosen.score)||nsRecordCount(chosen.state);
+  /* Recuperação automática de emergência: preserva tudo que existir no banco e na cópia local
+     mais completa, mas a cópia local vence conflitos porque foi justamente ela que contém os
+     registros desaparecidos. O POST continua protegido por expectedUpdatedAt/CAS. */
+  const merged=remoteState?normalize(nsMergeState(remoteState,chosen.state,tombstoneSet(remoteState,chosen.state),null)):normalize(chosen.state);
+  const mergedCount=nsRecordCount(merged);
+  state=merged;window.__NS_RECOVERY_SELECTED__={...chosen,state:structuredClone(merged),score:mergedCount};
+  try{localStorage.setItem(STORE,JSON.stringify(state))}catch(_){}
+  try{await nsRecoveryIDBPut(structuredClone(state),'AUTO-RECOVERY-PRE-RESTORE')}catch(_){}
+  lastKnownServerState=remoteState?structuredClone(remoteState):null;
+  lastServerUpdatedAt=remote?.updatedAt||remoteState?.updatedAt||'';
+  window.__NS_RECOVERY_LOCK__=false;
+  changeSeq=Math.max(changeSeq,Number(state?.__nsSync?.localSeq)||0)+1;pending=true;
+  const snapshot=nsPrepareSnapshot(changeSeq);
+  if(!writePending(snapshot))throw new Error('Não foi possível proteger a cópia local antes da restauração.');
+  nsSyncLog('AUTO_RECOVERY_START',{localCount,remoteCount,mergedCount,source:`${chosen.source||''}:${chosen.key||''}`});
+  try{
+    const verified=await nsPostAndVerify(snapshot);
+    state=normalize(verified.state);
+    lastKnownServerState=structuredClone(verified.state);
+    lastServerUpdatedAt=verified.response?.updatedAt||verified.state?.updatedAt||snapshot.updatedAt||'';
+    lastConfirmedSeq=changeSeq;lastConfirmedSaveId=nsPendingSaveId(snapshot);pending=false;clearPending();retryCount=0;clearTimeout(retryTimer);retryTimer=null;
+    try{localStorage.setItem(STORE,JSON.stringify(state))}catch(_){}
+    try{await nsRecoveryIDBPut(structuredClone(state),'AUTO-RECOVERY-CONFIRMED')}catch(_){}
+    window.__NS_RECOVERY_LOCK__=false;
+    const confirmed=nsRecordCount(state);
+    status('ok',`RECUPERADO · ${confirmed} registros confirmados no banco`);
+    nsSyncLog('AUTO_RECOVERY_OK',{confirmed,localCount,remoteCount});
+    try{toast(`✓ Dados recuperados: ${confirmed} registros confirmados no banco`)}catch(_){}
+    return{ok:true,count:confirmed,localCount,remoteCount};
+  }catch(e){
+    window.__NS_RECOVERY_LOCK__=true;pending=true;
+    try{writePending(snapshot)}catch(_){}
+    try{localStorage.setItem(STORE,JSON.stringify(state))}catch(_){}
+    try{await nsRecoveryIDBPut(structuredClone(state),'AUTO-RECOVERY-FAILED-PRESERVED')}catch(_){}
+    status('error',`RECUPERAÇÃO PRESERVADA LOCALMENTE · banco não confirmado`);
+    nsSyncLog('AUTO_RECOVERY_ERROR',{status:Number(e?.status)||0,message:e?.message||String(e),localCount,remoteCount});
+    throw e;
+  }
+}
 async function bootstrap(role){
   status('saving','Conectando ao banco sem gravar…');
   window.__NS_RECOVERY_LOCK__=true;
@@ -8556,9 +8601,21 @@ async function bootstrap(role){
   }
 
   if(suspiciousRemote){
-    state=normalize(chosen.state);window.__NS_RECOVERY_SELECTED__=chosen;pending=!!pend;try{localStorage.setItem(STORE,JSON.stringify(state))}catch(_){};try{nsRecoveryIDBPut(structuredClone(state),'boot-local-richer')}catch(_){};
-    status('error',`RECUPERAÇÃO: local ${chosenCount} × banco ${remoteCount} · envio bloqueado`);
-    try{toast(`⚠ Recuperação encontrada: ${chosenCount} registros locais; banco tem ${remoteCount}`)}catch(_){}
+    state=normalize(chosen.state);window.__NS_RECOVERY_SELECTED__=chosen;pending=!!pend;try{localStorage.setItem(STORE,JSON.stringify(state))}catch(_){};try{await nsRecoveryIDBPut(structuredClone(state),'boot-local-richer')}catch(_){};
+    status('error',`RECUPERAÇÃO: local ${chosenCount} × banco ${remoteCount} · restaurando com segurança…`);
+    try{toast(`⚠ Cópia mais completa encontrada: ${chosenCount} registros locais; banco tem ${remoteCount}`)}catch(_){}
+    if(String(role)==='1'){
+      try{
+        const rec=await nsAutoRestoreRicherLocal(chosen,remote,role);
+        if(rec?.ok)return {exists:true,recovered:true,autoRestored:true,recoveryLocked:false,remoteCount,localCount:chosenCount,confirmedCount:rec.count,source:`${chosen.source}:${chosen.key||''}`};
+      }catch(e){
+        console.error('Recuperação automática não conseguiu confirmar o banco; cópia local mantida.',e);
+        window.__NS_RECOVERY_LOCK__=true;pending=true;try{writePending(state)}catch(_){};
+        status('error',`RECUPERAÇÃO LOCAL PRESERVADA (${chosenCount}) · clique em Recuperar dados`);
+        return {exists:!!remote?.exists,recovered:true,recoveryLocked:true,remoteCount,localCount:chosenCount,source:`${chosen.source}:${chosen.key||''}`,error:e};
+      }
+    }
+    window.__NS_RECOVERY_LOCK__=true;
     return {exists:!!remote?.exists,recovered:true,recoveryLocked:true,remoteCount,localCount:chosenCount,source:`${chosen.source}:${chosen.key||''}`}
   }
 

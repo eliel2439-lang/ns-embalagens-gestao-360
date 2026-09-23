@@ -1,0 +1,29 @@
+NS EMBALAGENS — RECUPERAÇÃO AUTOMÁTICA DE DADOS
+
+O status "RECUPERAÇÃO: local 284 × banco 10" significa que o navegador ainda possui uma cópia local mais completa que o banco.
+
+COMO PUBLICAR
+1. Descompacte este ZIP.
+2. Substitua no projeto os arquivos:
+   - index.html
+   - api/sync.js
+3. Publique/deploy no MESMO projeto e no MESMO domínio do Vercel.
+4. Abra o sistema no MESMO navegador/computador em que apareceu "local 284 × banco 10".
+5. Entre com Acesso 1.
+
+O QUE ESTA VERSÃO FAZ
+- Se a cópia local tiver mais dados que o banco, ela é recuperada automaticamente.
+- Antes de gravar, o sistema mescla a cópia local com qualquer registro ainda existente no banco.
+- A gravação usa controle de versão (CAS), evitando sobrescrita concorrente.
+- Depois do POST, o sistema faz GET e só libera a sincronização se a recuperação for confirmada.
+- A cópia local também é preservada em localStorage e IndexedDB.
+- O backend mantém histórico das versões anteriores da linha main.
+
+RESULTADO ESPERADO
+Depois do login do Acesso 1, o topo deve mudar para algo como:
+RECUPERADO · 284 registros confirmados no banco
+(o número pode ser maior se o merge preservar registros adicionais do banco.)
+
+IMPORTANTE
+Não limpe cache, cookies ou dados do site antes da recuperação.
+Não abra por file:///C:/...; use o mesmo domínio do Vercel.
