@@ -1,9 +1,13 @@
+<!-- NS EMERGENCY RECOVERY 2026-09-22 · BANCO: protege e restaura automaticamente a cópia local mais completa quando a base remota volta drasticamente vazia/parcial; nunca limpa a cópia local antes de POST + GET de verificação. -->
+<!-- NS DB AUDIT FIX 2026-09-16 · persistência reforçada: verificação POST→GET, fila sem race, merge 3-way, tombstones compartilhados, timeout e diagnóstico. -->
 <!-- NS FIX 2026-09-15b · PRODUÇÃO: Total do processo no dia agora segue o checklist oficial (primeiro início → último término). Semana/mês somam o total de cada dia. Produção e Ajuste continuam separados; ocupação/saldo usam o total diário. -->
 <!-- NS UPDATE 2026-09-09 · PRAZO DE ENTREGA DINÂMICO: prazo atual = carteira aberta ÷ R$ 14.000/dia. Exibido no PDF do Relatório do Dia e no Acesso 4; acompanha automaticamente aumento/redução da carteira. Regra operacional solicitada: parte inteira do cálculo, com mínimo de 1 dia útil quando houver carteira. -->
 <!-- NS FIX 2026-09-08 · RELATÓRIO DO DIA / PRODUÇÃO: leitura unificada dos apontamentos. O relatório diário, semanal e evolução mensal agora reconhecem aliases históricos de data, processo, UF/OEF, quantidade, tempo final, ajuste e paradas (incluindo numeroUF, quantidade, qtd, tempoProducaoMin, inicio/fimProducao etc.), em vez de depender só dos campos novos. -->
 <!-- NS UPDATE 2026-09-09 · RELATÓRIO DO DIA / META SEMANAL: página 5 exclusiva para faturamento semanal, com redistribuição proporcional do saldo das semanas encerradas pelos dias úteis restantes. Página 6 exclusiva para Produção em Valor, usando Acabamento como total oficial e mantendo os demais processos detalhados. -->
 <!-- NS FIX 2026-09-08b · RELATÓRIO DO DIA: elimina about:blank, adiciona fallback de metas e captura qualquer erro de geração. -->
 <!-- NS UPDATE 2026-09-08 · RELATÓRIO DO DIA / PRODUÇÃO: o Controle de Produção foi incorporado ao PDF do Relatório do Dia, sem criar página nova no sistema. O sistema mantém 7 processos (Riscador, Impressora, Corte e Vinco, Coladeira, Acabamento, Serra e Grampeadeira), com Riscador/Impressora em 9h45 seg–qui e 8h45 sexta; demais em 8h45 seg–qui e 7h45 sexta. O PDF inclui controle diário por processo e matriz mensal de UFs/dia + caixas/h. -->
+<!-- NS FIX 2026-09-16 · BANCO/CAS: POST agora envia expectedUpdatedAt e o backend deve usar compare-and-swap atômico. Conflitos HTTP 409 nunca sobrescrevem: o cliente relê, faz merge e tenta novamente; saveId idempotente evita falso erro após timeout. -->
+<!-- NS UPDATE 2026-09-22 · RELATÓRIO DO DIA: nova página de evolução diária da meta com projeção de fechamento, diferença R$ para o ideal e percentual acima/abaixo do ideal por data. -->
 <!DOCTYPE html>
 <!-- NS FIX 2026-09-11 · RELATÓRIO DO DIA: entregas em janela móvel de 5 dias úteis, espelho canônico do Controle de Entregas e paginação segura de atrasados. -->
 <!-- NS FIX 2026-09-09 · IMPORTAÇÃO RISCADOR XLSX: horários e Tempo Final gravados pelo Excel como frações decimais em células numéricas agora são reconhecidos mesmo após o leitor XLSX convertê-los para texto. O layout real do checklist 2026 com 2 blocos de Ajuste + Produção e coluna NOME sem Total Pessoas é aceito diretamente. -->
@@ -1933,6 +1937,8 @@ body[data-ns-access-role="4"] #recordFields select[name="vendedor"]{font-weight:
 <button class="btn" id="btnPrint">Imprimir / PDF</button>
 <button class="btn" id="btnBackup">Backup</button>
 <button class="btn" id="btnDbSize" type="button">Tamanho do banco</button>
+<button class="btn" id="btnDbDiag" type="button">Diagnóstico banco</button>
+<button class="btn danger" id="btnRecovery" type="button" title="Ver e restaurar cópias locais/banco sem sobrescrever automaticamente">Recuperar dados</button>
 </div>
 </header>
 <nav class="nav" id="desktopNav">
@@ -3589,11 +3595,57 @@ function nsStorageSet(key,value){try{if(!window.localStorage)return false;localS
 function nsStorageRemove(key){try{if(window.localStorage)localStorage.removeItem(key);return true}catch(e){console.warn('Não foi possível remover do armazenamento local:',e);return false}}
 // A base antiga do navegador é lida apenas para migração inicial. Depois que o Supabase responde,
 // ele passa a ser a fonte oficial e o localStorage deixa de armazenar a base operacional.
-function loadState(){try{const raw=nsStorageGet(STORE)||nsStorageGet(LEGACY_STORE);const x=raw?JSON.parse(raw):null;if(x&&typeof window!=='undefined')window.__NS_LOCAL_MIGRATION_STATE__=x;return x?{...structuredClone(EMPTY),...x}:structuredClone(EMPTY)}catch(e){console.warn('Base local antiga inválida; iniciando base limpa.',e);return structuredClone(EMPTY)}}
+/* NS RECOVERY-FIRST 2026-09-22: nenhuma cópia local é apagada automaticamente.
+   O sistema varre TODAS as chaves JSON de localStorage/sessionStorage e mantém também
+   snapshots no IndexedDB. Se uma cópia local parecer mais completa que o banco, ela é
+   mostrada na tela e o envio ao banco fica BLOQUEADO até confirmação explícita. */
+const NS_RECOVERY_DB='ns_embalagens_recovery_v1';
+const NS_RECOVERY_STORE='snapshots';
+function nsLocalRecoveryScore(x){
+  if(!x||typeof x!=='object'||Array.isArray(x))return 0;
+  const top=['faturamentos','comercialVendasPdf','pedidos','cotacoes','producao','fretes','entregas','vendedores','materiaPrimaCompras','materiaPrimaNotasPdf','materiaPrimaPedidosPdf','materiaPrimaPdfImports','metaFeriados','revenueImportHistory'];
+  let n=top.reduce((z,k)=>z+(Array.isArray(x[k])?x[k].length:0),0);
+  for(const k of ['notasEntrada','contasPagarMP','documentosImportados'])n+=Array.isArray(x.financeiro360?.[k])?x.financeiro360[k].length:0;
+  for(const k of ['invoices','purchaseOrders','purchases','docImports'])n+=Array.isArray(x.purchase360?.[k])?x.purchase360[k].length:0;
+  n+=x.programacaoDia&&typeof x.programacaoDia==='object'?Object.keys(x.programacaoDia).length:0;
+  return n
+}
+function nsParseStored(raw){try{const x=raw?JSON.parse(raw):null;return x&&typeof x==='object'&&!Array.isArray(x)?x:null}catch(_){return null}}
+function nsLooksLikeState(x){if(!x||typeof x!=='object'||Array.isArray(x))return false;const keys=['pedidos','faturamentos','producao','entregas','fretes','metas','programacaoDia','financeiro360','purchase360','updatedAt'];return keys.some(k=>Object.prototype.hasOwnProperty.call(x,k))}
+function nsWrapRecoveryCandidate(key,x){
+  if(!x||typeof x!=='object'||Array.isArray(x))return null;
+  if(nsLooksLikeState(x))return x;
+  const k=String(key||'').toLowerCase();
+  if(k==='ns_embalagens_financeiro360_local_v2'||Array.isArray(x.notasEntrada)||Array.isArray(x.contasPagarMP))return {...structuredClone(EMPTY),financeiro360:x,updatedAt:x.updatedAt||null};
+  if(k==='nscomprasmateriaprimaultrav1'||Array.isArray(x.purchases)||Array.isArray(x.purchaseOrders)||Array.isArray(x.invoices))return {...structuredClone(EMPTY),purchase360:x,updatedAt:x.updatedAt||null};
+  return null
+}
+function nsCollectStorageCandidatesSync(){
+  const out=[],seen=new Set();
+  const add=(source,key,raw)=>{if(!raw||seen.has(source+'|'+key+'|'+raw.length))return;const parsed=nsParseStored(raw),x=nsWrapRecoveryCandidate(key,parsed);if(!x)return;seen.add(source+'|'+key+'|'+raw.length);out.push({source,key,state:x,score:nsLocalRecoveryScore(x),updatedAt:Date.parse(x.updatedAt||x.__nsSync?.updatedAtClient||0)||0,bytes:raw.length})};
+  try{for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i),raw=localStorage.getItem(k);if(raw&&raw.trim().startsWith('{'))add('localStorage',k,raw)}}catch(e){console.warn('Recovery scan localStorage:',e)}
+  try{for(let i=0;i<sessionStorage.length;i++){const k=sessionStorage.key(i),raw=sessionStorage.getItem(k);if(raw&&raw.trim().startsWith('{'))add('sessionStorage',k,raw)}}catch(e){console.warn('Recovery scan sessionStorage:',e)}
+  out.sort((a,b)=>(b.score-a.score)||(b.updatedAt-a.updatedAt)||(b.bytes-a.bytes));
+  return out
+}
+function nsRecoveryIDBOpen(){return new Promise((resolve,reject)=>{try{const q=indexedDB.open(NS_RECOVERY_DB,1);q.onupgradeneeded=()=>{const db=q.result;if(!db.objectStoreNames.contains(NS_RECOVERY_STORE)){const st=db.createObjectStore(NS_RECOVERY_STORE,{keyPath:'id'});st.createIndex('at','at')}};q.onsuccess=()=>resolve(q.result);q.onerror=()=>reject(q.error)}catch(e){reject(e)}})}
+async function nsRecoveryIDBPut(obj,label='snapshot'){
+  try{if(!obj||typeof obj!=='object')return false;const db=await nsRecoveryIDBOpen(),tx=db.transaction(NS_RECOVERY_STORE,'readwrite'),st=tx.objectStore(NS_RECOVERY_STORE),row={id:Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8),at:Date.now(),label,state:structuredClone(obj),score:nsLocalRecoveryScore(obj)};st.put(row);await new Promise((resolve,reject)=>{tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error)});db.close();const db2=await nsRecoveryIDBOpen(),tx2=db2.transaction(NS_RECOVERY_STORE,'readwrite'),st2=tx2.objectStore(NS_RECOVERY_STORE),all=await new Promise((resolve,reject)=>{const q=st2.getAll();q.onsuccess=()=>resolve(q.result||[]);q.onerror=()=>reject(q.error)});all.sort((a,b)=>b.at-a.at);for(const old of all.slice(8))st2.delete(old.id);await new Promise(resolve=>{tx2.oncomplete=resolve;tx2.onerror=resolve;tx2.onabort=resolve});db2.close();return true}catch(e){console.warn('Recovery IndexedDB backup indisponível:',e);return false}
+}
+async function nsRecoveryIDBList(){try{const db=await nsRecoveryIDBOpen(),tx=db.transaction(NS_RECOVERY_STORE,'readonly'),st=tx.objectStore(NS_RECOVERY_STORE),all=await new Promise((resolve,reject)=>{const q=st.getAll();q.onsuccess=()=>resolve(q.result||[]);q.onerror=()=>reject(q.error)});db.close();return all.sort((a,b)=>(b.score-a.score)||(b.at-a.at)).map(x=>({source:'IndexedDB',key:x.label+' @ '+new Date(x.at).toLocaleString('pt-BR'),state:x.state,score:x.score,updatedAt:x.at,bytes:0}))}catch(_){return[]}}
+function nsRecoveryExportState(obj,name='ns-recuperacao.json'){try{const blob=new Blob([JSON.stringify(obj,null,2)],{type:'application/json'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;document.body.appendChild(a);a.click();setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove()},500);return true}catch(e){alert('Não foi possível exportar a cópia: '+(e?.message||e));return false}}
+function loadState(){
+  try{
+    const candidates=nsCollectStorageCandidatesSync(),best=candidates[0]||null;
+    if(typeof window!=='undefined'){window.__NS_LOCAL_RECOVERY_FULL__=candidates;window.__NS_LOCAL_RECOVERY_CANDIDATES__=candidates.map(c=>({source:c.source,key:c.key,score:c.score,updatedAt:c.updatedAt,bytes:c.bytes}));window.__NS_LOCAL_MIGRATION_STATE__=best?.state||null;window.__NS_LOCAL_RECOVERY_SOURCE__=best?`${best.source}:${best.key}`:''}
+    return best?.state?{...structuredClone(EMPTY),...best.state}:structuredClone(EMPTY)
+  }catch(e){console.warn('Base local de recuperação inválida; iniciando estado temporário vazio sem gravar no banco.',e);return structuredClone(EMPTY)}
+}
 function save(){
   state.updatedAt=new Date().toISOString();
   /* backup local de segurança; a fonte oficial continua sendo /api/sync */
   try{if(window.localStorage)localStorage.setItem(STORE,JSON.stringify(state))}catch(e){console.warn('Backup local de segurança indisponível:',e)}
+  try{nsRecoveryIDBPut(structuredClone(state),'local-save')}catch(_){}
   if(window.NSCloud&&typeof window.NSCloud.queueSave==='function'){try{window.NSCloud.queueSave()}catch(e){console.error('Falha ao enfileirar sincronização:',e)}}else{console.warn('Sincronização em nuvem ainda não inicializada.')}
   try{renderPage()}catch(e){window.__NSLastRenderError={at:new Date().toISOString(),page:typeof currentPage!=='undefined'?currentPage:'',message:e?.message||String(e)};console.error('Falha de renderização após salvar — os dados continuam enfileirados para sincronização:',e);try{toast('Dados salvos; uma área visual encontrou erro e foi isolada.')}catch(_){}}
 }
@@ -4997,8 +5049,27 @@ function nsPurchaseSetActive(route){document.querySelectorAll('[data-purchase-ro
 function nsPurchaseGo(route){nsPurchasePendingRoute=route||'overview';nsPurchaseSetActive(nsPurchasePendingRoute);const d=nsPurchaseDoc();if(!d||!d.body)return;const btn=d.querySelector(`[data-route="${nsPurchasePendingRoute}"]`);if(btn)btn.click()}
 function nsPurchaseSyncPeriod(){const d=nsPurchaseDoc(),p=document.getElementById('purchasePeriod');if(!d||!p||!p.value)return;const [y,m]=p.value.split('-');const ys=d.getElementById('year-select'),ms=d.getElementById('month-select');if(ys){ys.value=y;ys.dispatchEvent(new Event('change',{bubbles:true}))}setTimeout(()=>{const dd=nsPurchaseDoc(),mm=dd&&dd.getElementById('month-select');if(mm){mm.value=`${y}-${m}`;mm.dispatchEvent(new Event('change',{bubbles:true}))}},0)}
 function nsPurchaseAction(action){const d=nsPurchaseDoc();if(!d)return;if(action==='po'){nsPurchaseGo('pdfops');setTimeout(()=>{const f=nsPurchaseDoc()?.getElementById('ops-po-file');if(f)f.click()},80)}else if(action==='nf'){nsPurchaseGo('pdfops');setTimeout(()=>{const f=nsPurchaseDoc()?.getElementById('ops-nf-file');if(f)f.click()},80)}else nsPurchaseGo('pdfops')}
-function nsAuditCapturePurchaseState(saveCloud=false){try{const b=document.getElementById('purchaseFrame')?.contentWindow?.NSPurchaseBridge;if(!b||typeof b.getState!=='function')return false;const snap=b.getState();if(!snap||typeof snap!=='object')return false;state.purchase360=structuredClone(snap);if(saveCloud&&window.NSCloud?.queueSave)window.NSCloud.queueSave();return true}catch(e){console.warn('Captura Compras:',e);return false}}
-function nsAuditHydratePurchaseFrame(){try{const b=document.getElementById('purchaseFrame')?.contentWindow?.NSPurchaseBridge;if(!b)return false;if(state.purchase360&&typeof b.setState==='function')return b.setState(state.purchase360);if(typeof b.getState==='function'){const snap=b.getState();if(snap&&typeof snap==='object'){state.purchase360=structuredClone(snap);return true}}}catch(e){console.warn('Restauração Compras:',e)}return false}
+function nsAuditCapturePurchaseState(saveCloud=false){
+  try{
+    const b=document.getElementById('purchaseFrame')?.contentWindow?.NSPurchaseBridge;if(!b||typeof b.getState!=='function')return false;
+    /* Captura automática antes do save só é permitida depois que o iframe recebeu a versão oficial do state.
+       Uma mensagem NS_PURCHASE_UPDATED (saveCloud=true) continua podendo capturar uma alteração feita pelo usuário. */
+    if(!saveCloud&&!window.__NSPurchaseHydratedFromMain)return false;
+    const snap=b.getState();if(!snap||typeof snap!=='object')return false;state.purchase360=structuredClone(snap);state.updatedAt=new Date().toISOString();
+    if(saveCloud&&window.NSCloud?.queueSave)window.NSCloud.queueSave();return true
+  }catch(e){console.warn('Captura Compras:',e);return false}
+}
+function nsAuditHydratePurchaseFrame(){
+  try{
+    const b=document.getElementById('purchaseFrame')?.contentWindow?.NSPurchaseBridge;if(!b)return false;
+    if(state.purchase360&&typeof state.purchase360==='object'&&typeof b.setState==='function'){
+      const ok=b.setState(state.purchase360);window.__NSPurchaseHydratedFromMain=true;window.__NSPurchaseHydratedAt=new Date().toISOString();return ok===undefined?true:ok
+    }
+    /* Banco oficial sem purchase360: não adota automaticamente um localStorage antigo do iframe.
+       O iframe só sobe dados quando o usuário realmente altera Compras e emite NS_PURCHASE_UPDATED. */
+    window.__NSPurchaseHydratedFromMain=false;return false
+  }catch(e){console.warn('Restauração Compras:',e);return false}
+}
 if(!window.__NSPurchaseSnapshotBound){window.__NSPurchaseSnapshotBound=true;window.addEventListener('message',e=>{if(e?.data?.type!=='NS_PURCHASE_UPDATED')return;setTimeout(()=>nsAuditCapturePurchaseState(true),50)})}
 function nsPurchaseBind(){document.querySelectorAll('[data-purchase-route]').forEach(b=>{if(b.dataset.boundPurchase)return;b.dataset.boundPurchase='1';b.addEventListener('click',()=>nsPurchaseGo(b.dataset.purchaseRoute))});const p=document.getElementById('purchasePeriod');if(p&&!p.dataset.boundPurchase){p.dataset.boundPurchase='1';p.addEventListener('change',nsPurchaseSyncPeriod)}const po=document.getElementById('purchaseImportPO');if(po&&!po.dataset.boundPurchase){po.dataset.boundPurchase='1';po.addEventListener('click',()=>nsPurchaseAction('po'))}const nf=document.getElementById('purchaseImportNF');if(nf&&!nf.dataset.boundPurchase){nf.dataset.boundPurchase='1';nf.addEventListener('click',()=>nsPurchaseAction('nf'))}const cl=document.getElementById('purchaseClearAll');if(cl&&!cl.dataset.boundPurchase){cl.dataset.boundPurchase='1';cl.addEventListener('click',nsPurchaseClearOnlyFromParent)}}
 function renderCompras360(){nsPurchaseBind();const p=document.getElementById('purchasePeriod');if(p&&!p.value)p.value=selectedMonth||isoToday().slice(0,7);const f=document.getElementById('purchaseFrame');if(!f)return;if(!nsPurchaseLoaded){nsPurchaseLoaded=true;f.addEventListener('load',()=>{setTimeout(()=>{nsAuditHydratePurchaseFrame();nsPurchaseSyncPeriod();nsPurchaseGo(nsPurchasePendingRoute)},80)},{once:true});f.srcdoc=nsPurchaseDecode()}else{nsAuditHydratePurchaseFrame();nsPurchaseSyncPeriod();nsPurchaseGo(nsPurchasePendingRoute)}}
@@ -6864,6 +6935,37 @@ setTimeout(()=>{try{if(typeof currentPage!=='undefined'&&currentPage==='executiv
    };
    const footer=()=>{pdf.setDrawColor(...LINE);pdf.setLineWidth(0.3);pdf.line(M,286,PW-M,286);pdf.setFont('helvetica','normal');pdf.setFontSize(6.8);setMuted();pdf.text(`Gerado em ${dateBR(isoToday())} às ${new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'})} · NS Embalagens Command Center`,PW-M,291,{align:'right'})};
 
+
+   /* NS UPDATE 2026-09-22 · RELATÓRIO DO DIA / HISTÓRICO DIÁRIO DA META.
+      Nova página mostra, dia a dia, como evoluíram: projeção de fechamento,
+      diferença em R$ para o ideal acumulado e diferença percentual em relação
+      ao ideal daquele dia. Faturamento feito em sábado/domingo/feriado entra no
+      acumulado e altera a projeção, mas NÃO cria um dia útil extra na meta. */
+   const nsGoalHistory=(()=>{
+    const month=String(d.today||isoToday()).slice(0,7),parts=month.split('-').map(Number),yy=parts[0],mm=parts[1];
+    if(!yy||!mm)return{points:[],target:Number(g.target)||0,totalUseful:Number(g.ws?.total)||0,idealDay:Number(g.idealDay)||0};
+    const last=new Date(yy,mm,0).getDate(),target=Number(g.target)||0;
+    const holidays=new Set((Array.isArray(state?.metaFeriados)?state.metaFeriados:[]).map(x=>normalizeISODate(x?.data||x)).filter(Boolean));
+    const iso=day=>`${yy}-${String(mm).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
+    const isUseful=day=>{const dt=new Date(yy,mm-1,day,12,0,0),key=iso(day),wd=dt.getDay();return wd!==0&&wd!==6&&!holidays.has(key)};
+    const revByDay=new Map();
+    (state.faturamentos||[]).forEach(r=>{const dt=normalizeISODate(r?.data||r?.dataFaturamento||r?.emissao||'');if(!dt||dt.slice(0,7)!==month)return;revByDay.set(dt,(revByDay.get(dt)||0)+n(r?.valor))});
+    const usefulDays=Array.from({length:last},(_,i)=>i+1).filter(isUseful),totalUseful=usefulDays.length||Number(g.ws?.total)||0,idealDay=totalUseful?target/totalUseful:0;
+    const endDay=Math.max(1,Math.min(last,Number(String(d.today||'').slice(8,10))||last));
+    let cumulative=0,elapsedUseful=0;const points=[];
+    for(let day=1;day<=endDay;day++){
+     const key=iso(day),dayRevenue=revByDay.get(key)||0; cumulative+=dayRevenue;
+     const useful=isUseful(day);if(useful)elapsedUseful++;
+     const include=useful||Math.abs(dayRevenue)>.005||key===d.today;
+     if(!include)continue;
+     const ideal=idealDay*elapsedUseful,projection=elapsedUseful?cumulative/elapsedUseful*totalUseful:cumulative,gap=cumulative-ideal,gapPct=ideal?gap/ideal*100:0;
+     points.push({date:key,day,dayRevenue,cumulative,elapsedUseful,ideal,projection,gap,gapPct,useful});
+    }
+    return{month,points,target,totalUseful,idealDay};
+   })();
+   const nsHistShortMoney=v=>{const x=Number(v)||0,a=Math.abs(x),sign=x<0?'-':'';if(a>=1000000)return `${sign}R$ ${(a/1000000).toFixed(1).replace('.',',')} mi`;if(a>=1000)return `${sign}R$ ${(a/1000).toFixed(a>=100000?0:1).replace('.',',')} mil`;return `${sign}${money(a)}`};
+   const nsHistShortNumber=v=>{const x=Number(v)||0,a=Math.abs(x),sign=x<0?'-':'';if(a>=1000000)return `${sign}${(a/1000000).toFixed(1).replace('.',',')}mi`;if(a>=1000)return `${sign}${(a/1000).toFixed(a>=100000?0:1).replace('.',',')}k`;return `${sign}${Math.round(a)}`};
+
    /* NS PDF 2026-09-08f · RELATÓRIO COMPACTADO EM 2 FOLHAS.
       Folha 1: resumo + programação resumida + programação detalhada.
       Folha 2: controle de entrega + entregas da semana + pedidos atrasados.
@@ -6924,8 +7026,53 @@ setTimeout(()=>{try{if(typeof currentPage!=='undefined'&&currentPage==='executiv
    if(p.obs){const oy=y+2*(blockH+4)-1;pdf.setFont('helvetica','bold');pdf.setFontSize(6.5);setRed();pdf.text('OBS.:',M,oy);pdf.setFont('helvetica','normal');pdf.setFontSize(6.3);setInk();pdf.text(split(p.obs,PW-2*M-12,6.3).slice(0,1),M+11,oy)}
    footer();
 
-   /* PÁGINA 2 · entregas + semana + pedidos atrasados, tudo na mesma folha */
-   pdf.addPage();reportPageNo++;y=header(`${dateBR(d.today)} · Controle de entrega e atrasos`,`PÁGINA ${reportPageNo}`);
+   /* NOVA PÁGINA · EVOLUÇÃO DIÁRIA DA META DE FATURAMENTO */
+   pdf.addPage('a4','landscape');reportPageNo++;
+   {
+    const HW=pdf.internal.pageSize.getWidth(),HH=pdf.internal.pageSize.getHeight(),HM=10,pts=nsGoalHistory.points||[],cur=pts.length?pts[pts.length-1]:null;
+    pdf.setFillColor(255,255,255);pdf.rect(0,0,HW,HH,'F');pdf.setDrawColor(...LINE);setInk();
+    pdf.setFont('helvetica','bold');pdf.setFontSize(16);pdf.text('Relatório do Dia - NS Embalagens',HM,14);
+    pdf.setFont('helvetica','normal');pdf.setFontSize(8);setMuted();pdf.text(`${dateBR(d.today)} · Evolução diária da meta de faturamento`,HM,20);
+    pdf.setFont('helvetica','bold');pdf.setFontSize(8);setRed();pdf.text(`PÁGINA ${reportPageNo}`,HW-HM,14,{align:'right'});
+    pdf.setDrawColor(...RED);pdf.setLineWidth(.8);pdf.line(HM,24,HW-HM,24);
+    pdf.setFont('helvetica','normal');pdf.setFontSize(5.8);setMuted();
+    pdf.text('Leitura histórica: a projeção é recalculada em cada data com o faturamento acumulado até aquele momento. Sábado/domingo/feriado com faturamento entra no acumulado, sem aumentar os dias úteis da meta.',HM,29,{maxWidth:HW-2*HM});
+
+    const cards=[
+     ['Projeção na data',cur?money(cur.projection):'—',cur?`${cur.elapsedUseful} dia(s) útil(eis) transcorrido(s)`:'sem histórico'],
+     ['Faturado acumulado',cur?money(cur.cumulative):money(g.actual),'até a data analisada'],
+     ['Diferença para o ideal',cur?`${cur.gap>=0?'+':''}${money(cur.gap)}`:'—',cur?(cur.gap>=0?'acima do ideal acumulado':'abaixo do ideal acumulado'):''],
+     ['Diferença percentual',cur?`${cur.gapPct>=0?'+':''}${cur.gapPct.toFixed(1)}%`:'—','percentual sobre o valor ideal do dia']
+    ];
+    const cg=3,cw2=(HW-2*HM-cg*3)/4,cy=33;
+    cards.forEach((z,i)=>{const x=HM+i*(cw2+cg);pdf.setDrawColor(...LINE);pdf.setLineWidth(.3);pdf.roundedRect(x,cy,cw2,15,1.4,1.4,'S');pdf.setFont('helvetica','bold');pdf.setFontSize(5.6);setMuted();pdf.text(z[0].toUpperCase(),x+2,cy+3.7,{maxWidth:cw2-4});pdf.setFontSize(8.5);setInk();pdf.text(split(z[1],cw2-4,8.5).slice(0,1),x+2,cy+8.2);pdf.setFont('helvetica','normal');pdf.setFontSize(5.0);setMuted();pdf.text(split(z[2],cw2-4,5.0).slice(0,1),x+2,cy+12.2)});
+
+    const chartFrame=(title,subtitle,yy,h)=>{pdf.setDrawColor(...LINE);pdf.setLineWidth(.35);pdf.roundedRect(HM,yy,HW-2*HM,h,1.5,1.5,'S');pdf.setFont('helvetica','bold');pdf.setFontSize(7.4);setRed();pdf.text(title.toUpperCase(),HM+3,yy+5);pdf.setFont('helvetica','normal');pdf.setFontSize(5.2);setMuted();pdf.text(subtitle,HM+3,yy+8.6,{maxWidth:HW-2*HM-6});return{x:HM+17,y:yy+12,w:HW-2*HM-21,h:h-18}};
+    const drawDates=(area)=>{if(!pts.length)return;const step=pts.length>1?area.w/(pts.length-1):0;pdf.setFont('helvetica','normal');pdf.setFontSize(4.4);setMuted();pts.forEach((p,i)=>{const x=area.x+(pts.length>1?i*step:area.w/2);pdf.text(String(p.day).padStart(2,'0'),x,area.y+area.h+4,{align:'center'})})};
+    const drawEmpty=(area)=>{pdf.setFont('helvetica','normal');pdf.setFontSize(8);setMuted();pdf.text('Sem dados suficientes para montar o histórico diário.',area.x+area.w/2,area.y+area.h/2,{align:'center'})};
+    const drawLine=(title,subtitle,yy,h)=>{
+     const a=chartFrame(title,subtitle,yy,h);if(!pts.length){drawEmpty(a);return}
+     const vals=pts.map(p=>p.projection),all=vals.concat([nsGoalHistory.target]).filter(Number.isFinite),rawMin=Math.min(...all),rawMax=Math.max(...all),pad=Math.max(1000,(rawMax-rawMin)*.16),vmin=Math.max(0,rawMin-pad),vmax=Math.max(vmin+1,rawMax+pad),toY=v=>a.y+a.h-(v-vmin)/(vmax-vmin)*a.h,step=pts.length>1?a.w/(pts.length-1):0;
+     pdf.setDrawColor(235,237,241);pdf.setLineWidth(.2);for(let i=0;i<=3;i++){const yy2=a.y+a.h*i/3;pdf.line(a.x,yy2,a.x+a.w,yy2);const val=vmax-(vmax-vmin)*i/3;pdf.setFont('helvetica','normal');pdf.setFontSize(4.2);setMuted();pdf.text(nsHistShortNumber(val),a.x-1.5,yy2+1.2,{align:'right'})}
+     if(nsGoalHistory.target>0){const ty=toY(nsGoalHistory.target);pdf.setDrawColor(...RED);pdf.setLineWidth(.45);pdf.setLineDashPattern([2,1.5],0);pdf.line(a.x,ty,a.x+a.w,ty);pdf.setLineDashPattern([],0);pdf.setFont('helvetica','bold');pdf.setFontSize(4.5);setRed();pdf.text(`META ${nsHistShortMoney(nsGoalHistory.target)}`,a.x+a.w-1,ty-1.2,{align:'right'})}
+     pdf.setDrawColor(...BLUE);pdf.setLineWidth(.8);let px=null,pyy=null;pts.forEach((p,i)=>{const x=a.x+(pts.length>1?i*step:a.w/2),yy2=toY(p.projection);if(px!=null)pdf.line(px,pyy,x,yy2);pdf.setFillColor(...BLUE);pdf.circle(x,yy2,1.0,'F');pdf.setFont('helvetica','bold');pdf.setFontSize(4.0);setBlue();const label=nsHistShortNumber(p.projection);const ly=Math.max(a.y+3,yy2-2.0);pdf.text(label,x,ly,{align:'center'});px=x;pyy=yy2});drawDates(a)
+    };
+    const drawBars=(title,subtitle,yy,h,key,percent=false)=>{
+     const a=chartFrame(title,subtitle,yy,h);if(!pts.length){drawEmpty(a);return}
+     const vals=pts.map(p=>Number(p[key])||0),maxAbs=Math.max(percent?1:1000,...vals.map(v=>Math.abs(v)))*1.12,zeroY=a.y+a.h/2,scale=(a.h/2)/maxAbs,slot=a.w/Math.max(1,pts.length),bw=Math.max(1.4,Math.min(7,slot*.58));
+     pdf.setDrawColor(235,237,241);pdf.setLineWidth(.2);pdf.line(a.x,a.y+a.h*.25,a.x+a.w,a.y+a.h*.25);pdf.line(a.x,a.y+a.h*.75,a.x+a.w,a.y+a.h*.75);pdf.setDrawColor(145,150,160);pdf.setLineWidth(.45);pdf.line(a.x,zeroY,a.x+a.w,zeroY);
+     pdf.setFont('helvetica','normal');pdf.setFontSize(4.1);setMuted();pdf.text(percent?`${maxAbs.toFixed(0)}%`:nsHistShortNumber(maxAbs),a.x-1.5,a.y+1.5,{align:'right'});pdf.text('0',a.x-1.5,zeroY+1.3,{align:'right'});pdf.text(percent?`-${maxAbs.toFixed(0)}%`:nsHistShortNumber(-maxAbs),a.x-1.5,a.y+a.h+1,{align:'right'});
+     pts.forEach((p,i)=>{const v=Number(p[key])||0,x=a.x+slot*(i+.5),bh=Math.abs(v)*scale,y0=v>=0?zeroY-bh:zeroY;pdf.setFillColor(...(v>=0?GREEN:RED));pdf.rect(x-bw/2,y0,bw,Math.max(.35,bh),'F');pdf.setFont('helvetica','bold');pdf.setFontSize(4.0);v>=0?pdf.setTextColor(...GREEN):setRed();const lab=percent?`${v>=0?'+':''}${v.toFixed(1)}%`:`${v>=0?'+':''}${nsHistShortNumber(v)}`;const ly=v>=0?Math.max(a.y+3,y0-1.1):Math.min(a.y+a.h-1,y0+bh+3);pdf.text(lab,x,ly,{align:'center'});pdf.setFont('helvetica','normal');pdf.setFontSize(4.3);setMuted();pdf.text(String(p.day).padStart(2,'0'),x,a.y+a.h+4,{align:'center'})})
+    };
+
+    drawLine('Projeção de fechamento - evolução diária','Quanto o mês projetava fechar em cada data, com base no ritmo acumulado até aquele momento.',52,42);
+    drawBars('Diferença para o ideal - R$','Faturado acumulado menos o valor que deveria estar faturado até cada data. Verde = acima; vermelho = abaixo.',98,42,'gap',false);
+    drawBars('Percentual acima / abaixo do ideal','Diferença percentual em relação ao valor ideal acumulado daquele dia (não são pontos percentuais da meta mensal).',144,42,'gapPct',true);
+    pdf.setDrawColor(...LINE);pdf.line(HM,202,HW-HM,202);pdf.setFont('helvetica','normal');pdf.setFontSize(5.2);setMuted();pdf.text('Eixo horizontal = dia do mês. Dias não úteis só aparecem quando houve faturamento (ou quando são a data analisada).',HM,206,{maxWidth:HW-2*HM-55});pdf.text(`Gerado em ${dateBR(isoToday())} · NS Embalagens`,HW-HM,206,{align:'right'});
+   }
+
+   /* PRÓXIMA PÁGINA · entregas + janela de 5 dias úteis + pedidos atrasados */
+   pdf.addPage('a4','portrait');reportPageNo++;y=header(`${dateBR(d.today)} · Controle de entrega e atrasos`,`PÁGINA ${reportPageNo}`);
    y=sectionTitle(`Controle de entrega · entregas de hoje (${todayReportDeliveries.length})`,y);
    const dc=[{label:'Cliente',w:76},{label:'Tipo',w:35},{label:'Valor',w:38,align:'right'},{label:'Situação',w:35,align:'right'}];y=tableHeader(dc,y,6);
    if(todayReportDeliveries.length){todayReportDeliveries.forEach(x=>{const m=nsReportDeliveryMeta(x,d.today),isProm=m.type==='Prometida';y=tableRow(dc,[x.cliente||'—',isProm?'PROMETIDA':'PROGRAMAÇÃO',money(x.valor),normText(x.status)==='ENTREGUE'?'Entregue':'Pendente'],y,5.8,{redCol:isProm?1:null,blueCol:isProm?null:1,fontSize:7.7})})}else y=tableRow(dc,['Nenhuma entrega prevista','—','—','—'],y,5.8,{fontSize:7.7});
@@ -8197,6 +8344,19 @@ function writePending(x){
 }
 function clearPending(){try{localStorage.removeItem(PENDING_KEY);sessionStorage.removeItem(PENDING_KEY)}catch(_){}}
 let saveTimer=null,saving=false,pending=false,retryTimer=null,retryCount=0,lastServerUpdatedAt='',lastSavePromise=Promise.resolve();
+let changeSeq=0,lastConfirmedSeq=0,lastConfirmedSaveId='',lastGetAt='',lastPostAt='',lastHttpStatus=0,lastVerifyAt='';
+const CLIENT_KEY='ns_embalagens_sync_client_v2';
+const DIAG_LIMIT=100;
+const syncEvents=[];
+function nsClientId(){try{let v=localStorage.getItem(CLIENT_KEY);if(!v){v='client_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,10);localStorage.setItem(CLIENT_KEY,v)}return v}catch(_){return 'session_'+Math.random().toString(36).slice(2,10)}}
+const NS_CLIENT_ID=nsClientId();
+function nsSyncLog(type,data={}){const row={at:new Date().toISOString(),type,...data};syncEvents.push(row);if(syncEvents.length>DIAG_LIMIT)syncEvents.splice(0,syncEvents.length-DIAG_LIMIT);window.__NSCloudSyncLog=syncEvents;return row}
+function nsNewSaveId(){return 'save_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,10)}
+function nsEnsureMeta(obj){if(!obj||typeof obj!=='object')return{};if(!obj.__nsSync||typeof obj.__nsSync!=='object'||Array.isArray(obj.__nsSync))obj.__nsSync={};return obj.__nsSync}
+function nsMetaRevision(obj){return Math.max(0,Number(obj?.__nsSync?.revision)||0)}
+function nsPendingSaveId(obj){return String(obj?.__nsSync?.lastSaveId||'')}
+function nsSafeSize(obj){try{return new Blob([JSON.stringify(obj)]).size}catch(_){try{return JSON.stringify(obj).length}catch(__){return 0}}}
+
 const $=s=>document.querySelector(s);
 function status(kind,text){const el=$('#nsCloudStatus'),tx=$('#nsCloudStatusText');if(!el)return;el.hidden=false;el.className='ns-cloud-status ns-cloud-'+kind;if(tx)tx.textContent=text||kind}
 function token(){return sessionStorage.getItem(TOKEN_KEY)||''}
@@ -8204,19 +8364,27 @@ function setToken(v){if(v)sessionStorage.setItem(TOKEN_KEY,v);else sessionStorag
 async function request(url,opt={}){
   const headers={...(opt.headers||{})};
   if(opt.body&&!headers['Content-Type'])headers['Content-Type']='application/json';
-  const r=await fetch(url,{...opt,headers,cache:'no-store',credentials:'same-origin'});
-  const raw=await r.text();
-  let body=null;
-  if(raw){
-    try{body=JSON.parse(raw)}
-    catch(_){
-      const clean=raw.replace(/\s+/g,' ').trim().slice(0,220);
-      const e=new Error(`API ${url} não retornou JSON (HTTP ${r.status}). ${clean||'Resposta vazia.'}`);
-      e.status=r.status;e.raw=raw;throw e;
-    }
-  }else body={};
-  if(!r.ok){const e=new Error(body?.error||body?.message||('Erro '+r.status));e.status=r.status;e.body=body;throw e}
-  return body;
+  const timeoutMs=Math.max(5000,Number(opt.timeoutMs)||30000),ctrl=new AbortController();
+  const inherited=opt.signal;if(inherited){if(inherited.aborted)ctrl.abort();else inherited.addEventListener('abort',()=>ctrl.abort(),{once:true})}
+  const timer=setTimeout(()=>ctrl.abort(),timeoutMs),started=Date.now();
+  nsSyncLog('HTTP_START',{url,method:opt.method||'GET',bytes:typeof opt.body==='string'?opt.body.length:0});
+  try{
+    const r=await fetch(url,{...opt,headers,cache:'no-store',credentials:'same-origin',signal:ctrl.signal});
+    lastHttpStatus=r.status;
+    const raw=await r.text();
+    let body=null;
+    if(raw){
+      try{body=JSON.parse(raw)}
+      catch(_){const clean=raw.replace(/\s+/g,' ').trim().slice(0,220);const e=new Error(`API ${url} não retornou JSON (HTTP ${r.status}). ${clean||'Resposta vazia.'}`);e.status=r.status;e.raw=raw;throw e}
+    }else body={};
+    if(!r.ok){const e=new Error(body?.error||body?.message||('Erro '+r.status));e.status=r.status;e.body=body;throw e}
+    nsSyncLog('HTTP_OK',{url,method:opt.method||'GET',status:r.status,ms:Date.now()-started});
+    return body;
+  }catch(e){
+    if(e?.name==='AbortError'){const x=new Error(`Tempo limite ao acessar ${url} (${Math.round(timeoutMs/1000)}s).`);x.status=408;x.cause=e;e=x}
+    nsSyncLog('HTTP_ERROR',{url,method:opt.method||'GET',status:Number(e?.status)||0,message:e?.message||String(e),ms:Date.now()-started});
+    throw e;
+  }finally{clearTimeout(timer)}
 }
 
 /* NS FIX 2026-09-14 · BANCO: o estado completo passou a ultrapassar o limite de corpo do /api/sync.
@@ -8256,29 +8424,86 @@ async function nsCloudUnpackState(value){
 }
 async function nsCloudPostState(snapshot){
   const packed=await nsCloudPackState(snapshot);
-  return request('/api/sync',{method:'POST',body:JSON.stringify({state:packed})})
+  /* Concorrência otimista: o servidor só aceita o POST se a versão no banco ainda for
+     exatamente a que este navegador leu. Isso impede um computador/aba desatualizado
+     de sobrescrever silenciosamente uma alteração mais nova de outro dispositivo. */
+  const body=JSON.stringify({
+    state:packed,
+    expectedUpdatedAt:lastServerUpdatedAt||null,
+    saveId:nsPendingSaveId(snapshot)||null,
+    clientId:NS_CLIENT_ID
+  });
+  lastPostAt=new Date().toISOString();
+  window.__NSCloudPayloadStats={...(window.__NSCloudPayloadStats||{}),httpBodyBytes:new Blob([body]).size,at:lastPostAt};
+  nsSyncLog('POST_STATE',{saveId:nsPendingSaveId(snapshot),revision:nsMetaRevision(snapshot),records:nsRecordCount(snapshot),bytes:window.__NSCloudPayloadStats.httpBodyBytes,expectedUpdatedAt:lastServerUpdatedAt||null});
+  return request('/api/sync',{method:'POST',body,timeoutMs:45000})
 }
-function hasData(x){if(!x||typeof x!=='object')return false;
-  const arrays=['faturamentos','comercialVendasPdf','pedidos','cotacoes','producao','fretes','entregas','vendedores','materiaPrimaCompras','materiaPrimaNotasPdf','materiaPrimaPedidosPdf','materiaPrimaPdfImports','metaFeriados','revenueImportHistory'];
-  if(arrays.some(k=>Array.isArray(x[k])&&x[k].length))return true;
-  if(Object.keys(x.metas||{}).length||Object.keys(x.weeklyControl||{}).length||Object.keys(x.fechamentos||{}).length||Object.keys(x.programacaoDia||{}).length)return true;
-  if(Array.isArray(x.financeiro360?.notasEntrada)&&x.financeiro360.notasEntrada.length)return true;
-  if(Array.isArray(x.financeiro360?.contasPagarMP)&&x.financeiro360.contasPagarMP.length)return true;
-  if(Array.isArray(x.purchase360?.invoices)&&x.purchase360.invoices.length)return true;
-  if(Array.isArray(x.purchase360?.purchaseOrders)&&x.purchase360.purchaseOrders.length)return true;
-  if(Array.isArray(x.purchase360?.purchases)&&x.purchase360.purchases.length)return true;
+function hasData(x){
+  if(!x||typeof x!=='object')return false;
+  if(nsRecordCount(x)>0)return true;
+  const maps=['metas','weeklyControl','fechamentos','programacaoDia','freteAnual','metaPedidosConfig','metaFaturamentoVendedores','efficiencySnapshots','advanced360','premium','gerencial','estrategia','negocio','integracoes','kpiTargets'];
+  if(maps.some(k=>x[k]&&typeof x[k]==='object'&&!Array.isArray(x[k])&&Object.keys(x[k]).length))return true;
+  const f=x.financeiro360;if(f&&typeof f==='object'&&(Object.keys(f).some(k=>!['updatedAt'].includes(k)&&((Array.isArray(f[k])&&f[k].length)||(!Array.isArray(f[k])&&f[k]!=null&&f[k]!==''&&f[k]!==0)))))return true;
+  const p=x.purchase360;if(p&&typeof p==='object'&&Object.keys(p).some(k=>(Array.isArray(p[k])&&p[k].length)||(!Array.isArray(p[k])&&p[k]&&typeof p[k]==='object'&&Object.keys(p[k]).length)))return true;
   return false
 }
-function nsRecordCount(x){if(!x||typeof x!=='object')return 0;let n=['faturamentos','comercialVendasPdf','pedidos','cotacoes','producao','fretes','entregas','vendedores','materiaPrimaCompras','materiaPrimaNotasPdf','materiaPrimaPedidosPdf','materiaPrimaPdfImports'].reduce((z,k)=>z+(Array.isArray(x[k])?x[k].length:0),0);n+=Array.isArray(x.financeiro360?.notasEntrada)?x.financeiro360.notasEntrada.length:0;n+=Array.isArray(x.purchase360?.invoices)?x.purchase360.invoices.length:0;n+=Array.isArray(x.purchase360?.purchaseOrders)?x.purchase360.purchaseOrders.length:0;return n}
+function nsRecordCount(x){
+  if(!x||typeof x!=='object')return 0;
+  const top=['faturamentos','comercialVendasPdf','pedidos','cotacoes','producao','fretes','entregas','vendedores','materiaPrimaCompras','materiaPrimaNotasPdf','materiaPrimaPedidosPdf','materiaPrimaPdfImports','metaFeriados','revenueImportHistory'];
+  let n=top.reduce((z,k)=>z+(Array.isArray(x[k])?x[k].length:0),0);
+  for(const k of ['notasEntrada','contasPagarMP','documentosImportados'])n+=Array.isArray(x.financeiro360?.[k])?x.financeiro360[k].length:0;
+  for(const k of ['invoices','purchaseOrders','purchases','docImports'])n+=Array.isArray(x.purchase360?.[k])?x.purchase360[k].length:0;
+  n+=x.programacaoDia&&typeof x.programacaoDia==='object'?Object.keys(x.programacaoDia).length:0;
+  return n
+}
 function normalize(x){return x&&typeof x==='object'?{...structuredClone(EMPTY),...x}:structuredClone(EMPTY)}
-function clearOldLocal(){try{nsStorageRemove(STORE);nsStorageRemove(LEGACY_STORE)}catch(_){}}
+function clearOldLocal(){
+  /* O STORE atual é mantido como backup de recuperação. Somente a chave realmente legada é removida. */
+  try{nsStorageRemove(LEGACY_STORE)}catch(_){}
+  try{if(window.localStorage&&typeof state!=='undefined')localStorage.setItem(STORE,JSON.stringify(state))}catch(e){console.warn('Sync: não foi possível atualizar o backup local conhecido.',e)}
+}
 const NS_MERGE_COLLECTIONS=['faturamentos','comercialVendasPdf','pedidos','cotacoes','producao','fretes','entregas','vendedores','materiaPrimaCompras','materiaPrimaNotasPdf','materiaPrimaPedidosPdf','materiaPrimaPdfImports','metaFeriados','revenueImportHistory'];
-const TOMB_KEY='ns_embalagens_tombstones_v1';
-/* NS FIX 2026-08-28: registro de "lápides" — todo id apagado pelo usuário entra aqui, pra nunca mais ser trazido de volta pelo merge, mesmo que ainda apareça numa cópia antiga do banco buscada de outro navegador. */
-function readTombstones(){try{const raw=localStorage.getItem(TOMB_KEY);const arr=raw?JSON.parse(raw):[];return Array.isArray(arr)?arr:[]}catch(_){return[]}}
-function tombstoneSet(){return new Set(readTombstones().map(t=>String(t.id)))}
-function addTombstones(ids){if(!ids||!ids.length)return;try{const cur=readTombstones();const now=Date.now();const seen=new Set(cur.map(t=>String(t.id)));ids.forEach(id=>{const s=String(id);if(!seen.has(s)){cur.push({id:s,at:now});seen.add(s)}});const trimmed=cur.length>12000?cur.slice(cur.length-12000):cur;localStorage.setItem(TOMB_KEY,JSON.stringify(trimmed))}catch(_){}}
-function diffDeletions(prevState,curState){if(!prevState)return[];const out=[];NS_MERGE_COLLECTIONS.forEach(k=>{const prevIds=new Set((Array.isArray(prevState[k])?prevState[k]:[]).map(x=>String(x?.id)));const curIds=new Set((Array.isArray(curState[k])?curState[k]:[]).map(x=>String(x?.id)));prevIds.forEach(id=>{if(id&&id!=='undefined'&&!curIds.has(id))out.push(id)})});return out}
+const NS_MERGE_MAPS=['metas','freteAnual','fechamentos','weeklyControl','metaPedidosConfig','metaFaturamentoVendedores','efficiencySnapshots','advanced360','premium','gerencial','estrategia','negocio','integracoes','kpiTargets'];
+const NS_TOMB_ARRAY_PATHS=[...NS_MERGE_COLLECTIONS,'financeiro360.notasEntrada','financeiro360.contasPagarMP','financeiro360.documentosImportados','purchase360.purchases','purchase360.purchaseOrders','purchase360.invoices','purchase360.docImports'];
+const TOMB_KEY='ns_embalagens_tombstones_v2';
+function nsFastHash(s){s=String(s??'');let h=2166136261;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)}return (h>>>0).toString(16)}
+function nsItemKey(collection,x){
+  if(!x||typeof x!=='object')return 'null';
+  if(x.id!=null&&String(x.id)!=='')return 'id:'+String(x.id);
+  const norm=v=>String(v??'').trim().toUpperCase();
+  const date=v=>String(v??'').slice(0,10);
+  if(collection==='pedidos')return 'pedido:'+norm(x.numero||x.pedido)+'|'+norm(x.orcamento)+'|'+norm(x.cliente)+'|'+date(x.dataAprovacao||x.data);
+  if(collection==='faturamentos')return 'fat:'+norm(x.nota||x.numeroNota||x.nf)+'|'+date(x.data||x.emissao)+'|'+norm(x.cliente)+'|'+String(Number(x.valor||x.valorNota||0));
+  if(collection==='producao')return 'prod:'+norm(x.processo||x.operacao||x.etapa)+'|'+norm(x.numeroUF||x.uf||x.oef||x.of||x.numeroOF)+'|'+date(x.data||x.dataProducao)+'|'+norm(x.cliente);
+  if(collection==='entregas')return 'ent:'+norm(x.pedidoId||x.pedido||x.numero)+'|'+norm(x.cliente);
+  if(collection==='metaFeriados')return 'fer:'+date(x.data||x);
+  if(collection.includes('notasEntrada')||collection.includes('invoices'))return 'nf:'+norm(x.nfNo||x.numeroNF||x.numero||x.nota)+'|'+date(x.invoiceDate||x.data||x.emissao)+'|'+norm(x.supplier||x.fornecedor)+'|'+String(Number(x.total||x.valorTotal||x.valor||0));
+  if(collection.includes('purchaseOrders'))return 'po:'+norm(x.numero||x.orderNo||x.pedido)+'|'+date(x.data||x.issueDate)+'|'+norm(x.fornecedor||x.supplier);
+  try{return 'hash:'+nsFastHash(JSON.stringify(x))}catch(_){return 'hash:'+nsFastHash(String(x))}
+}
+function nsPathGet(obj,path){return String(path).split('.').reduce((v,k)=>v&&typeof v==='object'?v[k]:undefined,obj)}
+function nsTombKey(collection,itemOrKey,isMap=false){const key=isMap?'key:'+String(itemOrKey):nsItemKey(collection,itemOrKey);return collection+'::'+key}
+function readTombstones(){try{const raw=localStorage.getItem(TOMB_KEY)||localStorage.getItem('ns_embalagens_tombstones_v1');const arr=raw?JSON.parse(raw):[];return Array.isArray(arr)?arr:[]}catch(_){return[]}}
+function nsTombEntriesFromState(x){const a=x?.__nsSync?.tombstones;return Array.isArray(a)?a:[]}
+function tombstoneSet(...states){const out=new Set();const ingest=t=>{if(t==null)return;if(typeof t==='string')out.add(t);else if(t.key)out.add(String(t.key));else if(t.collection&&t.id!=null)out.add(String(t.collection)+'::id:'+String(t.id));else if(t.id!=null)out.add(String(t.id))};readTombstones().forEach(ingest);states.forEach(s=>nsTombEntriesFromState(s).forEach(ingest));return out}
+function addTombstones(items){
+  if(!Array.isArray(items)||!items.length)return;
+  const now=Date.now(),cur=readTombstones(),map=new Map();
+  const ingest=t=>{if(!t)return;const key=typeof t==='string'?t:(t.key||((t.collection&&t.id!=null)?String(t.collection)+'::id:'+String(t.id):String(t.id??'')));if(key)map.set(String(key),{key:String(key),at:Number(t.at)||now})};
+  cur.forEach(ingest);items.forEach(ingest);
+  const trimmed=[...map.values()].sort((a,b)=>a.at-b.at).slice(-15000);
+  try{localStorage.setItem(TOMB_KEY,JSON.stringify(trimmed))}catch(e){console.warn('Sync: tombstones locais não puderam ser gravados.',e)}
+  try{const m=nsEnsureMeta(state);m.tombstones=trimmed;state.__nsSync=m}catch(_){}
+}
+function diffDeletions(prevState,curState){
+  if(!prevState||!curState)return[];const out=[];
+  for(const path of NS_TOMB_ARRAY_PATHS){const pa=Array.isArray(nsPathGet(prevState,path))?nsPathGet(prevState,path):[],ca=Array.isArray(nsPathGet(curState,path))?nsPathGet(curState,path):[];const curKeys=new Set(ca.map(x=>nsItemKey(path,x)));for(const x of pa){const k=nsItemKey(path,x);if(k&&!curKeys.has(k))out.push({key:path+'::'+k,at:Date.now()})}}
+  for(const path of [...NS_MERGE_MAPS,'programacaoDia']){const p=nsPathGet(prevState,path),c=nsPathGet(curState,path);if(!p||typeof p!=='object'||Array.isArray(p))continue;const ck=new Set(c&&typeof c==='object'&&!Array.isArray(c)?Object.keys(c):[]);for(const k of Object.keys(p)){if(!ck.has(k))out.push({key:nsTombKey(path,k,true),at:Date.now()})}}
+  return out
+}
+function nsSame(a,b){if(a===b)return true;if(a==null||b==null)return a==null&&b==null;try{return JSON.stringify(a)===JSON.stringify(b)}catch(_){return false}}
+function nsRecordStamp(x){for(const k of ['_updatedAt','updatedAt','updated_at','modifiedAt','editedAt','importedAt']){const t=Date.parse(x?.[k]||'');if(t)return t}return 0}
+function nsChooseConflict(r,l,preferLocal,collection,key){const rt=nsRecordStamp(r),lt=nsRecordStamp(l);if(rt||lt)return lt>=rt?l:r;nsSyncLog('MERGE_CONFLICT',{collection,key,winner:preferLocal?'local':'remote'});return preferLocal?l:r}
 let lastKnownServerState=null;
 async function nsHashPassword(value){const data=new TextEncoder().encode(String(value||''));if(globalThis.crypto&&crypto.subtle){const buf=await crypto.subtle.digest('SHA-256',data);return Array.from(new Uint8Array(buf),b=>b.toString(16).padStart(2,'0')).join('')}let h=2166136261;for(const b of data){h^=b;h=Math.imul(h,16777619)}return 'fnv-'+(h>>>0).toString(16).padStart(8,'0')}
 async function login(role,password){
@@ -8290,177 +8515,235 @@ async function login(role,password){
   if(!expected||got!==expected){const e=new Error('Senha incorreta.');e.status=401;throw e}
   return {ok:true,role:r,token:'local-'+r};
 }
-async function fetchRemote(){const r=await request('/api/sync',{method:'GET'});if(r&&r.state)r.state=await nsCloudUnpackState(r.state);return r}
-async function bootstrap(role){
-  status('saving','Conectando…');
-  const legacy=window.__NS_LOCAL_MIGRATION_STATE__;
-  const pend=readPending();
-  let remote=null;
-  try{remote=await fetchRemote()}
-  catch(e){
-    if(pend&&hasData(pend)){state=normalize(pend);lastKnownServerState=structuredClone(state);status('error','Offline · alterações locais recuperadas');return {migrated:false,exists:false,recovered:true,offline:true,error:e}}
-    throw e;
-  }
-  if(pend&&hasData(pend)){
-    /* NS FIX 2026-08-28: em vez de decidir "pendente ganha" ou "banco ganha", MISTURA os dois — nenhum pedido/nota/cotação de nenhum dos dois lados é perdido (respeitando o que já foi apagado de propósito). */
-    try{
-      const merged=remote?.exists&&remote?.state?nsMergeState(remote.state,pend,tombstoneSet()):normalize(pend);
-      state=normalize(merged);
-      const saved=await nsCloudPostState(state);
-      lastServerUpdatedAt=saved.updatedAt||state.updatedAt||'';lastKnownServerState=structuredClone(state);clearPending();clearOldLocal();status('ok','Alterações pendentes recuperadas');return {migrated:false,exists:true,recovered:true}
-    }catch(e){
-      state=normalize(pend);lastKnownServerState=structuredClone(state);status('error','Offline · alterações recuperadas localmente');return {migrated:false,exists:!!remote?.exists,recovered:true,offline:true}
-    }
-  }
-  if(remote.exists&&remote.state){
-    if(String(role)==='1'&&!hasData(remote.state)&&hasData(legacy)){state=normalize(legacy);state.updatedAt=new Date().toISOString();const saved=await nsCloudPostState(state);lastServerUpdatedAt=saved.updatedAt||state.updatedAt;lastKnownServerState=structuredClone(state);clearOldLocal();delete window.__NS_LOCAL_MIGRATION_STATE__;clearPending();status('ok','Base migrada');return {migrated:true,exists:true}}
-    state=normalize(remote.state);lastServerUpdatedAt=remote.updatedAt||state.updatedAt||'';lastKnownServerState=structuredClone(state);clearOldLocal();clearPending();status('ok','Sincronizado');return {migrated:false,exists:true}
-  }
-  if(String(role)==='1'&&hasData(legacy)){
-    state=normalize(legacy);state.updatedAt=new Date().toISOString();
-    const saved=await nsCloudPostState(state);lastServerUpdatedAt=saved.updatedAt||state.updatedAt;lastKnownServerState=structuredClone(state);clearOldLocal();delete window.__NS_LOCAL_MIGRATION_STATE__;clearPending();status('ok','Base migrada');return {migrated:true,exists:true};
-  }
-  if(String(role)!=='1')throw new Error('A base do Supabase ainda não foi inicializada. Entre primeiro com o Acesso 1.');
-  state=structuredClone(EMPTY);state.updatedAt=new Date().toISOString();
-  const saved=await nsCloudPostState(state);lastServerUpdatedAt=saved.updatedAt||state.updatedAt;lastKnownServerState=structuredClone(state);clearOldLocal();clearPending();status('ok','Banco iniciado');return {migrated:false,exists:false};
+async function fetchRemote(){
+  const r=await request('/api/sync',{method:'GET',timeoutMs:30000});lastGetAt=new Date().toISOString();
+  if(r&&r.state)r.state=await nsCloudUnpackState(r.state);
+  if(r?.state&&typeof r.state==='object')nsSyncLog('GET_STATE',{revision:nsMetaRevision(r.state),saveId:nsPendingSaveId(r.state),records:nsRecordCount(r.state),bytes:nsSafeSize(r.state)});
+  return r
 }
-function nsMergeArrays(remoteArr,localArr,tombs,preferLocal=true){
-  /* NS FIX AUDIT · antes, o lado "local" sempre vencia um conflito de mesmo id, mesmo quando a versão
-     remota era mais recente (ex: outro computador atualizou o pedido). Isso fazia status/edições
-     voltarem sozinhos. Agora, em caso de conflito de id, vence o lado mais recente de fato
-     (preferLocal vem da comparação de updatedAt do estado em nsMergeState). Itens exclusivos de
-     qualquer um dos lados continuam sempre preservados — isso não muda. */
-  const map=new Map();
-  const stableKey=x=>{try{return '_semid_'+JSON.stringify(x)}catch(_){return '_semid_'+String(x)}};
-  (Array.isArray(remoteArr)?remoteArr:[]).forEach(x=>{if(!x)return;const id=x.id!=null?String(x.id):stableKey(x);if(!tombs||!tombs.has(id))map.set(id,x)});
-  (Array.isArray(localArr)?localArr:[]).forEach(x=>{if(!x)return;const id=x.id!=null?String(x.id):stableKey(x);if(preferLocal||!map.has(id))map.set(id,x)});
-  return [...map.values()];
+async function bootstrap(role){
+  status('saving','Conectando ao banco sem gravar…');
+  window.__NS_RECOVERY_LOCK__=true;
+  const pend=readPending();
+  let remote=null,remoteError=null;
+  try{remote=await fetchRemote()}catch(e){remoteError=e}
+
+  const syncCandidates=Array.isArray(window.__NS_LOCAL_RECOVERY_FULL__)?window.__NS_LOCAL_RECOVERY_FULL__.slice():[];
+  let idbCandidates=[];try{idbCandidates=await nsRecoveryIDBList()}catch(_){}
+  const candidates=[...syncCandidates,...idbCandidates].filter(c=>c&&c.state&&typeof c.state==='object');
+  candidates.sort((a,b)=>(Number(b.score)||0)-(Number(a.score)||0)||(Number(b.updatedAt)||0)-(Number(a.updatedAt)||0));
+  window.__NS_RECOVERY_ALL__=candidates;
+  const bestLocal=candidates[0]||null;
+  const remoteState=remote?.exists&&remote?.state&&typeof remote.state==='object'?remote.state:null;
+  const remoteCount=remoteState?nsRecordCount(remoteState):0;
+  const localCount=bestLocal?Number(bestLocal.score)||nsRecordCount(bestLocal.state):0;
+  lastKnownServerState=remoteState?structuredClone(remoteState):null;
+  lastServerUpdatedAt=remote?.updatedAt||remoteState?.updatedAt||'';
+
+  /* Se existe pending, ele representa alteração não confirmada. Nunca é descartado no boot. */
+  if(pend&&typeof pend==='object'){
+    const pc=nsRecordCount(pend);
+    if(!bestLocal||pc>=localCount){candidates.unshift({source:'pending',key:'ns_embalagens_pending_cloud_v1',state:pend,score:pc,updatedAt:Date.parse(pend.updatedAt||0)||Date.now()});window.__NS_RECOVERY_ALL__=candidates}
+  }
+
+  const chosen=(window.__NS_RECOVERY_ALL__||[])[0]||bestLocal;
+  const chosenCount=chosen?Number(chosen.score)||nsRecordCount(chosen.state):0;
+  const suspiciousRemote=!!chosen && chosenCount>remoteCount && (chosenCount-remoteCount>=3 || remoteCount<chosenCount*0.90);
+
+  if(remoteError){
+    if(chosen&&chosenCount>0){state=normalize(chosen.state);window.__NS_RECOVERY_SELECTED__=chosen;pending=true;try{writePending(state)}catch(_){};status('error',`Banco indisponível · ${chosenCount} registros locais protegidos`);try{nsRecoveryIDBPut(structuredClone(state),'boot-offline-recovered')}catch(_){};return {exists:false,recovered:true,offline:true,error:remoteError,localCount:chosenCount}}
+    state=structuredClone(EMPTY);status('error','Banco indisponível · gravação bloqueada');return {exists:false,recovered:false,offline:true,error:remoteError}
+  }
+
+  if(suspiciousRemote){
+    state=normalize(chosen.state);window.__NS_RECOVERY_SELECTED__=chosen;pending=!!pend;try{localStorage.setItem(STORE,JSON.stringify(state))}catch(_){};try{nsRecoveryIDBPut(structuredClone(state),'boot-local-richer')}catch(_){};
+    status('error',`RECUPERAÇÃO: local ${chosenCount} × banco ${remoteCount} · envio bloqueado`);
+    try{toast(`⚠ Recuperação encontrada: ${chosenCount} registros locais; banco tem ${remoteCount}`)}catch(_){}
+    return {exists:!!remote?.exists,recovered:true,recoveryLocked:true,remoteCount,localCount:chosenCount,source:`${chosen.source}:${chosen.key||''}`}
+  }
+
+  if(remoteState&&remoteCount>0){
+    state=normalize(remoteState);window.__NS_RECOVERY_LOCK__=false;lastConfirmedSaveId=nsPendingSaveId(state);lastConfirmedSeq=Number(state?.__nsSync?.localSeq)||0;try{localStorage.setItem(STORE,JSON.stringify(state))}catch(_){};try{nsRecoveryIDBPut(structuredClone(state),'server-confirmed-boot')}catch(_){};status('ok',`Sincronizado · ${remoteCount} registros`);nsSyncLog('BOOT_REMOTE_OK',{records:remoteCount,revision:nsMetaRevision(state)});return {exists:true,recovered:false,remoteCount}
+  }
+
+  if(chosen&&chosenCount>0){
+    state=normalize(chosen.state);window.__NS_RECOVERY_SELECTED__=chosen;pending=true;try{writePending(state)}catch(_){};try{nsRecoveryIDBPut(structuredClone(state),'boot-only-local')}catch(_){};status('error',`Banco sem dados · ${chosenCount} registros locais encontrados · restauração manual necessária`);return {exists:!!remote?.exists,recovered:true,recoveryLocked:true,remoteCount,localCount:chosenCount}
+  }
+
+  /* REGRA DE SEGURANÇA: nunca inicializar/salvar EMPTY automaticamente. */
+  state=structuredClone(EMPTY);window.__NS_RECOVERY_SELECTED__=null;status('error','Banco sem dados e nenhuma cópia local encontrada · GRAVAÇÃO BLOQUEADA');nsSyncLog('BOOT_EMPTY_BLOCKED',{});return {exists:!!remote?.exists,recovered:false,recoveryLocked:true,remoteCount:0,localCount:0}
+}
+function nsMergeArrays(remoteArr,localArr,tombs,preferLocal=true,collection='',baseArr=null){
+  const rMap=new Map(),lMap=new Map(),bMap=new Map();
+  const fill=(arr,map)=>{for(const x of (Array.isArray(arr)?arr:[])){if(!x)continue;map.set(nsItemKey(collection,x),x)}};fill(remoteArr,rMap);fill(localArr,lMap);fill(baseArr,bMap);
+  const keys=new Set([...rMap.keys(),...lMap.keys(),...bMap.keys()]),out=[];
+  for(const key of keys){
+    if(tombs&&(tombs.has(collection+'::'+key)||tombs.has(key.replace(/^id:/,''))||tombs.has(key)))continue;
+    const r=rMap.get(key),l=lMap.get(key),b=bMap.get(key),rh=rMap.has(key),lh=lMap.has(key),bh=bMap.has(key);
+    if(bh){
+      const rc=!nsSame(r,b),lc=!nsSame(l,b);
+      if(!lh&&!rc)continue;               // exclusão local, remoto não mudou
+      if(!rh&&!lc)continue;               // exclusão remota, local não mudou
+      if(lc&&!rc){if(lh)out.push(structuredClone(l));continue}
+      if(rc&&!lc){if(rh)out.push(structuredClone(r));continue}
+      if(!rh&&!lh)continue;
+      if(rh&&!lh){out.push(structuredClone(r));continue}
+      if(lh&&!rh){out.push(structuredClone(l));continue}
+      out.push(structuredClone(nsChooseConflict(r,l,preferLocal,collection,key)));continue
+    }
+    if(rh&&lh)out.push(structuredClone(nsChooseConflict(r,l,preferLocal,collection,key)));
+    else if(lh)out.push(structuredClone(l));
+    else if(rh)out.push(structuredClone(r));
+  }
+  return out
 }
 
-function nsMergePlainMap(remoteObj,localObj,preferLocal=true){
-  const r=remoteObj&&typeof remoteObj==='object'&&!Array.isArray(remoteObj)?remoteObj:{};
-  const l=localObj&&typeof localObj==='object'&&!Array.isArray(localObj)?localObj:{};
-  return preferLocal?{...structuredClone(r),...structuredClone(l)}:{...structuredClone(l),...structuredClone(r)}
+function nsMergePlainMap(remoteObj,localObj,preferLocal=true,collection='',baseObj=null,tombs=null){
+  const r=remoteObj&&typeof remoteObj==='object'&&!Array.isArray(remoteObj)?remoteObj:{},l=localObj&&typeof localObj==='object'&&!Array.isArray(localObj)?localObj:{},b=baseObj&&typeof baseObj==='object'&&!Array.isArray(baseObj)?baseObj:{};
+  const out={},keys=new Set([...Object.keys(r),...Object.keys(l),...Object.keys(b)]);
+  for(const k of keys){if(tombs?.has(nsTombKey(collection,k,true)))continue;const rh=Object.prototype.hasOwnProperty.call(r,k),lh=Object.prototype.hasOwnProperty.call(l,k),bh=Object.prototype.hasOwnProperty.call(b,k);const rv=r[k],lv=l[k],bv=b[k];if(bh){const rc=!nsSame(rv,bv),lc=!nsSame(lv,bv);if(!lh&&!rc)continue;if(!rh&&!lc)continue;if(lc&&!rc){if(lh)out[k]=structuredClone(lv);continue}if(rc&&!lc){if(rh)out[k]=structuredClone(rv);continue}if(!rh&&!lh)continue;if(rh&&!lh){out[k]=structuredClone(rv);continue}if(lh&&!rh){out[k]=structuredClone(lv);continue}out[k]=structuredClone(nsChooseConflict(rv,lv,preferLocal,collection,k));continue}if(rh&&lh)out[k]=structuredClone(nsChooseConflict(rv,lv,preferLocal,collection,k));else if(lh)out[k]=structuredClone(lv);else if(rh)out[k]=structuredClone(rv)}return out
 }
-function nsMergeFinanceBlock(remoteState,localState,tombs,preferLocal){
-  const r=remoteState?.financeiro360&&typeof remoteState.financeiro360==='object'?remoteState.financeiro360:{};
-  const l=localState?.financeiro360&&typeof localState.financeiro360==='object'?localState.financeiro360:{};
-  const out=preferLocal?{...structuredClone(r),...structuredClone(l)}:{...structuredClone(l),...structuredClone(r)};
-  out.notasEntrada=nsMergeArrays(r.notasEntrada,l.notasEntrada,tombs,preferLocal);
-  out.contasPagarMP=nsMergeArrays(r.contasPagarMP,l.contasPagarMP,tombs,preferLocal);
-  out.documentosImportados=nsMergeArrays(r.documentosImportados,l.documentosImportados,tombs,preferLocal);
+function nsMergeFinanceBlock(remoteState,localState,tombs,preferLocal,baseState=null){
+  const r=remoteState?.financeiro360&&typeof remoteState.financeiro360==='object'?remoteState.financeiro360:{},l=localState?.financeiro360&&typeof localState.financeiro360==='object'?localState.financeiro360:{},b=baseState?.financeiro360&&typeof baseState.financeiro360==='object'?baseState.financeiro360:{};
+  const out=nsMergePlainMap(r,l,preferLocal,'financeiro360',b,tombs);
+  for(const k of ['notasEntrada','contasPagarMP','documentosImportados'])out[k]=nsMergeArrays(r[k],l[k],tombs,preferLocal,'financeiro360.'+k,b[k]);
   return out
 }
-function nsMergePurchaseBlock(remoteState,localState,tombs,preferLocal){
-  const r=remoteState?.purchase360&&typeof remoteState.purchase360==='object'?remoteState.purchase360:{};
-  const l=localState?.purchase360&&typeof localState.purchase360==='object'?localState.purchase360:{};
+function nsMergePurchaseBlock(remoteState,localState,tombs,preferLocal,baseState=null){
+  const r=remoteState?.purchase360&&typeof remoteState.purchase360==='object'?remoteState.purchase360:{},l=localState?.purchase360&&typeof localState.purchase360==='object'?localState.purchase360:{},b=baseState?.purchase360&&typeof baseState.purchase360==='object'?baseState.purchase360:{};
   if(!Object.keys(r).length&&!Object.keys(l).length)return null;
-  const out=preferLocal?{...structuredClone(r),...structuredClone(l)}:{...structuredClone(l),...structuredClone(r)};
-  for(const k of ['purchases','purchaseOrders','invoices','docImports'])out[k]=nsMergeArrays(r[k],l[k],tombs,preferLocal);
-  out.settings=nsMergePlainMap(r.settings,l.settings,preferLocal);
-  out.closures=nsMergePlainMap(r.closures,l.closures,preferLocal);
-  return out
+  const out=nsMergePlainMap(r,l,preferLocal,'purchase360',b,tombs);
+  for(const k of ['purchases','purchaseOrders','invoices','docImports'])out[k]=nsMergeArrays(r[k],l[k],tombs,preferLocal,'purchase360.'+k,b[k]);
+  out.settings=nsMergePlainMap(r.settings,l.settings,preferLocal,'purchase360.settings',b.settings,tombs);out.closures=nsMergePlainMap(r.closures,l.closures,preferLocal,'purchase360.closures',b.closures,tombs);return out
 }
-function nsMergeProgramacaoDia(remoteState,localState,preferLocal){
-  const r=remoteState?.programacaoDia&&typeof remoteState.programacaoDia==='object'?remoteState.programacaoDia:{};
-  const l=localState?.programacaoDia&&typeof localState.programacaoDia==='object'?localState.programacaoDia:{};
-  const out={},days=new Set([...Object.keys(r),...Object.keys(l)]);
-  days.forEach(day=>{
-    const rd=r[day]&&typeof r[day]==='object'?r[day]:null,ld=l[day]&&typeof l[day]==='object'?l[day]:null;
-    if(!rd&&ld){out[day]=structuredClone(ld);return}
-    if(rd&&!ld){out[day]=structuredClone(rd);return}
-    if(!rd&&!ld)return;
-    const rt=Date.parse(rd?._updatedAt||'')||0,lt=Date.parse(ld?._updatedAt||'')||0;
-    /* A programação é manual e deve ser atômica por dia. A versão mais recente daquele DIA vence,
-       não o updatedAt global do painel (que pode mudar por faturamento, entregas etc.). */
-    const pick=lt||rt?(lt>=rt?ld:rd):(preferLocal?ld:rd);
-    out[day]=structuredClone(pick||{});
-  });
-  return out
+function nsMergeProgramacaoDia(remoteState,localState,preferLocal,baseState=null,tombs=null){
+  const r=remoteState?.programacaoDia&&typeof remoteState.programacaoDia==='object'?remoteState.programacaoDia:{},l=localState?.programacaoDia&&typeof localState.programacaoDia==='object'?localState.programacaoDia:{},b=baseState?.programacaoDia&&typeof baseState.programacaoDia==='object'?baseState.programacaoDia:{};
+  const out={},days=new Set([...Object.keys(r),...Object.keys(l),...Object.keys(b)]);
+  days.forEach(day=>{if(tombs?.has(nsTombKey('programacaoDia',day,true)))return;const rd=r[day],ld=l[day],bd=b[day],rh=Object.prototype.hasOwnProperty.call(r,day),lh=Object.prototype.hasOwnProperty.call(l,day),bh=Object.prototype.hasOwnProperty.call(b,day);if(bh){const rc=!nsSame(rd,bd),lc=!nsSame(ld,bd);if(!lh&&!rc)return;if(!rh&&!lc)return;if(lc&&!rc){if(lh)out[day]=structuredClone(ld);return}if(rc&&!lc){if(rh)out[day]=structuredClone(rd);return}}if(!rh&&!lh)return;if(rh&&!lh){out[day]=structuredClone(rd);return}if(lh&&!rh){out[day]=structuredClone(ld);return}const rt=Date.parse(rd?._updatedAt||'')||0,lt=Date.parse(ld?._updatedAt||'')||0;out[day]=structuredClone((lt||rt)?(lt>=rt?ld:rd):(preferLocal?ld:rd))});return out
 }
-function nsMergeState(remoteState,localState,tombs){
-  const rt=Date.parse(remoteState?.updatedAt||0)||0,lt=Date.parse(localState?.updatedAt||0)||0,preferLocal=lt>=rt;
-  const base=structuredClone(preferLocal?(localState||{}):(remoteState||{}));
-  NS_MERGE_COLLECTIONS.forEach(k=>{base[k]=nsMergeArrays(remoteState?.[k],localState?.[k],tombs,preferLocal)});
-  base.financeiro360=nsMergeFinanceBlock(remoteState,localState,tombs,preferLocal);
-  base.purchase360=nsMergePurchaseBlock(remoteState,localState,tombs,preferLocal);
-  base.programacaoDia=nsMergeProgramacaoDia(remoteState,localState,preferLocal);
-  for(const k of ['metas','freteAnual','fechamentos','weeklyControl','metaPedidosConfig','metaFaturamentoVendedores','efficiencySnapshots','advanced360','premium','gerencial','estrategia','negocio','integracoes','kpiTargets']){
-    base[k]=nsMergePlainMap(remoteState?.[k],localState?.[k],preferLocal)
+function nsMergeState(remoteState,localState,tombs,baseState=null){
+  remoteState=remoteState&&typeof remoteState==='object'?remoteState:{};localState=localState&&typeof localState==='object'?localState:{};baseState=baseState&&typeof baseState==='object'?baseState:null;
+  const rt=Date.parse(remoteState.updatedAt||0)||0,lt=Date.parse(localState.updatedAt||0)||0,preferLocal=lt>=rt,allTombs=tombstoneSet(remoteState,localState);if(tombs)for(const x of tombs)allTombs.add(x);
+  const base={};const special=new Set([...NS_MERGE_COLLECTIONS,...NS_MERGE_MAPS,'financeiro360','purchase360','programacaoDia','__nsSync','updatedAt','migracoes']);
+  const allKeys=new Set([...Object.keys(remoteState),...Object.keys(localState),...(baseState?Object.keys(baseState):[])]);
+  for(const k of allKeys){if(special.has(k))continue;const r=remoteState[k],l=localState[k],b=baseState?.[k],rh=Object.prototype.hasOwnProperty.call(remoteState,k),lh=Object.prototype.hasOwnProperty.call(localState,k),bh=!!baseState&&Object.prototype.hasOwnProperty.call(baseState,k);if(bh){const rc=!nsSame(r,b),lc=!nsSame(l,b);if(!lh&&!rc)continue;if(!rh&&!lc)continue;if(lc&&!rc){if(lh)base[k]=structuredClone(l);continue}if(rc&&!lc){if(rh)base[k]=structuredClone(r);continue}}if(rh&&lh)base[k]=structuredClone(nsChooseConflict(r,l,preferLocal,'state',k));else if(lh)base[k]=structuredClone(l);else if(rh)base[k]=structuredClone(r)}
+  NS_MERGE_COLLECTIONS.forEach(k=>{base[k]=nsMergeArrays(remoteState[k],localState[k],allTombs,preferLocal,k,baseState?.[k])});
+  base.financeiro360=nsMergeFinanceBlock(remoteState,localState,allTombs,preferLocal,baseState);base.purchase360=nsMergePurchaseBlock(remoteState,localState,allTombs,preferLocal,baseState);base.programacaoDia=nsMergeProgramacaoDia(remoteState,localState,preferLocal,baseState,allTombs);
+  for(const k of NS_MERGE_MAPS)base[k]=nsMergePlainMap(remoteState[k],localState[k],preferLocal,k,baseState?.[k],allTombs);
+  base.migracoes={...(remoteState.migracoes||{}),...(localState.migracoes||{}),...(base.migracoes||{})};
+  ['_freightSeedVersion','_purchaseResetVersion','_approvedOrdersReplacementVersion','_approvedOrdersReplacementAt'].forEach(k=>{if(base[k]==null&&remoteState[k]!=null)base[k]=remoteState[k];if(base[k]==null&&localState[k]!=null)base[k]=localState[k]});
+  const remoteMeta=remoteState.__nsSync&&typeof remoteState.__nsSync==='object'?remoteState.__nsSync:{},localMeta=localState.__nsSync&&typeof localState.__nsSync==='object'?localState.__nsSync:{};base.__nsSync=preferLocal?{...structuredClone(remoteMeta),...structuredClone(localMeta)}:{...structuredClone(localMeta),...structuredClone(remoteMeta)};base.__nsSync.revision=Math.max(nsMetaRevision(remoteState),nsMetaRevision(localState),nsMetaRevision(baseState||{}));base.__nsSync.tombstones=[...allTombs].map(key=>({key,at:Date.now()})).slice(-15000);base.updatedAt=new Date(Math.max(rt,lt,Date.parse(baseState?.updatedAt||0)||0)||Date.now()).toISOString();
+  try{const rep=typeof nsIntegrityRepairState==='function'?nsIntegrityRepairState(base):null;if(rep?.removedIds?.length)addTombstones(rep.removedIds.map(id=>({key:'legacy::id:'+id,at:Date.now()})))}catch(e){console.warn('Integridade durante merge do banco:',e)}return base
+}
+function nsValidateSnapshot(snapshot){
+  if(!snapshot||typeof snapshot!=='object'){const e=new Error('Snapshot inválido: não é um objeto.');e.status=422;throw e}
+  const before=nsRecordCount(lastKnownServerState),after=nsRecordCount(snapshot);
+  if(before>=80&&after<before*0.30){const tombs=nsTombEntriesFromState(snapshot).length,drop=before-after;if(tombs<Math.max(10,drop*0.55)){const e=new Error(`Proteção de integridade: a base cairia de ${before} para ${after} registros sem exclusões suficientes registradas.`);e.status=422;e.code='ABNORMAL_SHRINK';throw e}}
+  return true
+}
+async function nsPostAndVerify(snapshot){
+  nsValidateSnapshot(snapshot);const saveId=nsPendingSaveId(snapshot);let postRes=null;
+  try{postRes=await nsCloudPostState(snapshot)}catch(e){
+    /* 409 = outro navegador salvou depois da nossa última leitura. Nunca força overwrite.
+       Primeiro relê o banco. Se o mesmo saveId já estiver lá, o POST anterior apenas perdeu
+       a resposta e pode ser considerado confirmado. Caso contrário, devolve o remoto ao
+       merge de 3 vias e mantém a fila local para uma nova tentativa. */
+    if(Number(e?.status)===409){
+      try{
+        const current=await fetchRemote();
+        if(current?.exists&&current?.state){
+          const remoteSaveId=nsPendingSaveId(current.state);
+          if(saveId&&remoteSaveId===saveId){
+            lastVerifyAt=new Date().toISOString();
+            nsSyncLog('VERIFY_IDEMPOTENT_OK',{saveId,revision:nsMetaRevision(current.state),records:nsRecordCount(current.state)});
+            return {response:current,state:current.state}
+          }
+          e.remoteState=current.state;e.remoteUpdatedAt=current.updatedAt||current.state.updatedAt||'';
+        }
+      }catch(readErr){console.warn('Sync: conflito detectado e a releitura do banco também falhou.',readErr)}
+    }
+    throw e
   }
-  try{const rep=typeof nsIntegrityRepairState==='function'?nsIntegrityRepairState(base):null;if(rep?.removedIds?.length)addTombstones(rep.removedIds)}catch(e){console.warn('Integridade durante merge do banco:',e)}
-  /* NS FIX 2026-08-28: travas de "já rodei isso uma vez" (migrações, seeds) nunca podem sumir só porque o lado escolhido como base não as tinha ainda — senão as importações grandes (Riscador/Impressora, 1400+ registros) recomeçam do zero a cada login. */
-  base.migracoes={...(remoteState?.migracoes||{}),...(localState?.migracoes||{}),...(base.migracoes||{})};
-  ['_freightSeedVersion','_purchaseResetVersion','_approvedOrdersReplacementVersion','_approvedOrdersReplacementAt'].forEach(k=>{
-    if(base[k]==null&&remoteState?.[k]!=null)base[k]=remoteState[k];
-    if(base[k]==null&&localState?.[k]!=null)base[k]=localState[k];
-  });
-  return base;
+  const verify=await fetchRemote();if(!verify?.exists||!verify?.state){const e=new Error('O POST respondeu, mas o GET de verificação não encontrou a base.');e.status=502;e.code='VERIFY_EMPTY';throw e}
+  const gotId=nsPendingSaveId(verify.state),sameMarker=!!saveId&&gotId===saveId,sameUpdated=String(verify.state.updatedAt||'')===String(snapshot.updatedAt||'');
+  if(!sameMarker&&!sameUpdated){const e=new Error('O banco respondeu, mas a versão lida de volta não corresponde ao snapshot enviado. A fila será mantida.');e.status=409;e.code='VERIFY_MISMATCH';e.remoteState=verify.state;e.remoteUpdatedAt=verify.updatedAt||verify.state.updatedAt||'';throw e}
+  lastVerifyAt=new Date().toISOString();nsSyncLog('VERIFY_OK',{saveId,revision:nsMetaRevision(verify.state),records:nsRecordCount(verify.state),serverUpdatedAt:postRes?.updatedAt||verify.updatedAt||null});return {response:verify,state:verify.state}
 }
+function nsPrepareSnapshot(seq){
+  const snapshot=structuredClone(state),meta=nsEnsureMeta(snapshot),now=new Date().toISOString();snapshot.updatedAt=now;state.updatedAt=now;meta.clientId=NS_CLIENT_ID;meta.localSeq=seq;meta.revision=Math.max(nsMetaRevision(snapshot),nsMetaRevision(lastKnownServerState||{}))+1;meta.lastSaveId=nsNewSaveId();meta.updatedAtClient=now;meta.tombstones=[...tombstoneSet(snapshot,lastKnownServerState)].map(key=>({key,at:Date.now()})).slice(-15000);snapshot.__nsSync=meta;state.__nsSync=structuredClone(meta);return snapshot
+}
+function nsDiagnostics(){return {status:document.querySelector('#nsCloudStatusText')?.textContent||'',clientId:NS_CLIENT_ID,changeSeq,lastConfirmedSeq,lastConfirmedSaveId,pendingFlag:pending,pendingStored:!!readPending(),saving,retryCount,lastServerUpdatedAt,lastPostAt,lastGetAt,lastVerifyAt,lastHttpStatus,records:nsRecordCount(state),stateBytes:nsSafeSize(state),payload:window.__NSCloudPayloadStats||null,lastError:window.__NSCloudLastError?.message||'',events:syncEvents.slice(-25)}}
+function nsShowDiagnostics(){const d=nsDiagnostics(),p=d.payload||{};alert(`Diagnóstico do banco\n\nStatus: ${d.status||'—'}\nRegistros: ${d.records}\nTamanho local: ${(d.stateBytes/1024).toFixed(0)} KB\nFila pendente: ${d.pendingStored?'SIM':'não'}\nSalvando agora: ${d.saving?'SIM':'não'}\nAlterações locais: ${d.changeSeq}\nÚltima sequência confirmada: ${d.lastConfirmedSeq}\nÚltimo POST: ${d.lastPostAt||'—'}\nÚltimo GET: ${d.lastGetAt||'—'}\nÚltima verificação: ${d.lastVerifyAt||'—'}\nHTTP: ${d.lastHttpStatus||'—'}\nRevision: ${nsMetaRevision(state)}\nSave ID confirmado: ${d.lastConfirmedSaveId||'—'}\nJSON bruto: ${p.rawBytes?Math.round(p.rawBytes/1024)+' KB':'—'}\nPayload enviado: ${p.httpBodyBytes?Math.round(p.httpBodyBytes/1024)+' KB':'—'}\nÚltimo erro: ${d.lastError||'nenhum'}`)}
+async function nsTestConnection(){status('saving','Testando banco…');try{if(readPending()||pending)await flush();const r=await fetchRemote();if(!r?.exists||!r?.state)throw new Error('GET não retornou uma base válida.');const localId=nsPendingSaveId(state),remoteId=nsPendingSaveId(r.state),ok=!localId||localId===remoteId||String(state.updatedAt||'')===String(r.state.updatedAt||'');if(!ok)throw new Error('A versão local e a versão do banco estão divergentes.');status('ok','Banco verificado');toast('✓ Banco verificado por leitura real');nsSyncLog('MANUAL_TEST_OK',{records:nsRecordCount(r.state)});return true}catch(e){window.__NSCloudLastError=e;status('error','Falha no teste do banco');alert('Falha no teste do banco:\n\n'+(e?.message||e));return false}}
 let lastMergeCheckAt=0;
 function nsCloudScheduleRetry(){
-  clearTimeout(retryTimer);
-  if(!sessionStorage.getItem('ns_embalagens_access_role'))return;
-  const delay=Math.min(30000,Math.max(3000,3000*Math.pow(1.65,retryCount++)));
-  retryTimer=setTimeout(()=>{retryTimer=null;flush().catch(()=>{})},delay);
+  clearTimeout(retryTimer);if(!sessionStorage.getItem('ns_embalagens_access_role'))return;
+  const steps=[1000,2000,5000,10000,30000,60000],delay=steps[Math.min(retryCount,steps.length-1)];retryCount++;
+  nsSyncLog('RETRY_SCHEDULED',{delay,retryCount});retryTimer=setTimeout(()=>{retryTimer=null;flush().catch(()=>{})},delay)
 }
 async function flush(){
+  if(window.__NS_RECOVERY_LOCK__){status('error','Recuperação pendente · envio ao banco bloqueado');return false}
   if(saving){pending=true;return lastSavePromise}
   if(!sessionStorage.getItem('ns_embalagens_access_role'))return false;
-  saving=true;pending=false;status('saving','Salvando…');
-  try{nsAuditCapturePurchaseState(false)}catch(_){ }
-  if(lastKnownServerState){try{const dels=diffDeletions(lastKnownServerState,state);if(dels.length)addTombstones(dels)}catch(_){}}
-  const nowTs=Date.now();
-  if(nowTs-lastMergeCheckAt>10000){
-    lastMergeCheckAt=nowTs;
-    try{const remote=await fetchRemote();if(remote?.exists&&remote?.state)state=normalize(nsMergeState(remote.state,state,tombstoneSet()))}catch(e){console.warn('Sync: leitura prévia do banco falhou; o salvamento local continuará e será tentado diretamente.',e)}
-  }
-  const snapshot=structuredClone(state);snapshot.updatedAt=new Date().toISOString();state.updatedAt=snapshot.updatedAt;
-  /* A fila local é gravada ANTES do POST. Assim nenhuma alteração depende do debounce ou de fechar a página. */
-  if(!writePending(snapshot))console.warn('Sync: não foi possível criar a cópia pendente antes do envio.');
+  const flushSeq=Math.max(changeSeq,1);saving=true;pending=false;status('saving','Salvando no banco…');nsSyncLog('FLUSH_START',{seq:flushSeq});
+  try{nsAuditCapturePurchaseState(false)}catch(e){console.warn('Sync: captura de Compras falhou antes do save.',e)}
+  if(lastKnownServerState){try{const dels=diffDeletions(lastKnownServerState,state);if(dels.length){addTombstones(dels);nsSyncLog('DELETIONS_RECORDED',{count:dels.length})}}catch(e){console.warn('Sync: não foi possível registrar exclusões.',e)}}
   try{
-    lastSavePromise=nsCloudPostState(snapshot);
-    const res=await lastSavePromise;
-    lastServerUpdatedAt=res.updatedAt||snapshot.updatedAt;
-    lastKnownServerState=structuredClone(snapshot);
-    clearPending();clearTimeout(retryTimer);retryTimer=null;retryCount=0;
-    window.__NSCloudLastError=null;window.__NSCloudLastSuccessAt=new Date().toISOString();
-    status('ok','Sincronizado');
-    try{toast('✓ Salvo no banco de dados')}catch(_){ }
-    return true;
+    const nowTs=Date.now();if(nowTs-lastMergeCheckAt>3000){lastMergeCheckAt=nowTs;try{const remote=await fetchRemote();if(remote?.exists&&remote?.state){const baseBefore=lastKnownServerState;state=normalize(nsMergeState(remote.state,state,tombstoneSet(remote.state,state),baseBefore));lastKnownServerState=structuredClone(remote.state);lastServerUpdatedAt=remote.updatedAt||remote.state.updatedAt||lastServerUpdatedAt}}catch(e){if(Number(e?.status)===401)throw e;console.warn('Sync: leitura prévia do banco falhou; o snapshot continuará pendente até ser confirmado.',e)}}
+    const snapshot=nsPrepareSnapshot(flushSeq);if(!writePending(snapshot))console.warn('Sync: não foi possível criar a cópia pendente antes do envio.');
+    lastSavePromise=nsPostAndVerify(snapshot);const verified=await lastSavePromise;const verifiedState=verified.state;
+    lastKnownServerState=structuredClone(verifiedState);lastServerUpdatedAt=verified.response.updatedAt||verifiedState.updatedAt||snapshot.updatedAt;lastConfirmedSeq=flushSeq;lastConfirmedSaveId=nsPendingSaveId(snapshot);retryCount=0;clearTimeout(retryTimer);retryTimer=null;window.__NSCloudLastError=null;window.__NSCloudLastSuccessAt=new Date().toISOString();
+    if(changeSeq===flushSeq){clearPending();try{localStorage.setItem(STORE,JSON.stringify(verifiedState))}catch(_){}status('ok','Sincronizado');toast('✓ Salvo e conferido no banco');nsSyncLog('FLUSH_CONFIRMED',{seq:flushSeq,saveId:lastConfirmedSaveId});return true}
+    const latest=structuredClone(state);const lm=nsEnsureMeta(latest);lm.localSeq=changeSeq;writePending(latest);status('saving','Nova alteração pendente…');nsSyncLog('FLUSH_CONFIRMED_NEWER_PENDING',{seq:flushSeq,current:changeSeq});return true;
   }catch(e){
-    window.__NSCloudLastError=e;window.__NSCloudLastFailureAt=new Date().toISOString();
-    const code=Number(e?.status)||0;
-    const msg=code===413?'Limite do banco recusou até o envio compactado':code===401?'Sessão do banco recusada':'Banco pendente · tentando novamente';
-    status('error',msg);
-    try{toast(code===413?'O servidor recusou até a versão compactada. Os dados continuam preservados e serão tentados novamente.':'Dados preservados neste dispositivo · nova tentativa automática de salvar no banco')}catch(_){ }
-    console.error('Supabase sync:',e);
-    nsCloudScheduleRetry();
-    throw e;
-  }finally{
-    saving=false;
-    if(pending){pending=false;clearTimeout(saveTimer);saveTimer=setTimeout(()=>flush().catch(()=>{}),120)}
-  }
+    window.__NSCloudLastError=e;window.__NSCloudLastFailureAt=new Date().toISOString();const code=Number(e?.status)||0;const msg=code===413?'Banco recusou o tamanho do envio':code===401?'Sessão do banco recusada':code===409?'Banco divergiu · reenviando com merge':code===408?'Banco demorou demais · tentando novamente':'Banco pendente · tentando novamente';status('error',msg);console.error('Supabase sync:',e);nsSyncLog('FLUSH_ERROR',{seq:flushSeq,status:code,message:e?.message||String(e)});
+    if(e?.remoteState&&typeof e.remoteState==='object'){try{state=normalize(nsMergeState(e.remoteState,state,tombstoneSet(e.remoteState,state),lastKnownServerState));lastKnownServerState=structuredClone(e.remoteState);lastServerUpdatedAt=e.remoteUpdatedAt||e.remoteState.updatedAt||lastServerUpdatedAt}catch(_){} }
+    try{const latest=structuredClone(state);latest.updatedAt=new Date().toISOString();writePending(latest)}catch(_){}nsCloudScheduleRetry();throw e;
+  }finally{saving=false;if(changeSeq>lastConfirmedSeq||pending||readPending()){pending=false;clearTimeout(saveTimer);saveTimer=setTimeout(()=>flush().catch(()=>{}),180)}}
 }
 function queueSave(){
-  clearTimeout(saveTimer);
-  pending=true;
-  status('saving','Alterações…');
-  /* já protege a alteração no instante do clique, antes mesmo do POST */
-  try{const snap=structuredClone(state);snap.updatedAt=new Date().toISOString();state.updatedAt=snap.updatedAt;writePending(snap)}catch(e){console.warn('Sync: não foi possível preparar a fila local.',e)}
-  saveTimer=setTimeout(()=>flush().catch(()=>{}),150);
+  clearTimeout(saveTimer);changeSeq++;pending=true;
+  try{const snap=structuredClone(state),m=nsEnsureMeta(snap);snap.updatedAt=new Date().toISOString();state.updatedAt=snap.updatedAt;m.clientId=NS_CLIENT_ID;m.localSeq=changeSeq;m.updatedAtClient=snap.updatedAt;m.tombstones=[...tombstoneSet(snap,lastKnownServerState)].map(key=>({key,at:Date.now()})).slice(-15000);snap.__nsSync=m;state.__nsSync=structuredClone(m);if(!writePending(snap))throw new Error('Fila local indisponível');try{nsRecoveryIDBPut(structuredClone(snap),'pending-local')}catch(_){};nsSyncLog('QUEUE',{seq:changeSeq,records:nsRecordCount(snap),bytes:nsSafeSize(snap)})}catch(e){window.__NSCloudLastError=e;status('error','Falha ao proteger alteração');console.error('Sync: não foi possível preparar a fila local.',e)}
+  if(window.__NS_RECOVERY_LOCK__){status('error','Recuperação pendente · alteração protegida localmente, NÃO enviada ao banco');return}
+  status('saving','Alterações pendentes…');saveTimer=setTimeout(()=>flush().catch(()=>{}),180)
 }
 async function refreshIfNewer(force=false){
+  if(window.__NS_RECOVERY_LOCK__)return false;
   if(!sessionStorage.getItem('ns_embalagens_access_role')||saving||pending)return false;
-  if(readPending()){status('saving','Sync pendente…');nsCloudScheduleRetry();return false;}
-  try{const r=await fetchRemote();if(!r.exists||!r.state)return false;const ru=Date.parse(r.updatedAt||r.state.updatedAt||0),lu=Date.parse(lastServerUpdatedAt||state.updatedAt||0);if(force||ru>lu+500){state=normalize(nsMergeState(r.state,state,tombstoneSet()));if(typeof normalizeCoreState==='function')normalizeCoreState();lastServerUpdatedAt=r.updatedAt||state.updatedAt||'';if(typeof renderPage==='function')renderPage();setTimeout(()=>{try{nsAuditHydratePurchaseFrame()}catch(_){}},0);status('ok','Atualizado');return true}status('ok','Sincronizado');return false}catch(e){if(e.status===401){status('error','Sessão expirada')}else status('error','Sem conexão');return false}
+  if(readPending()){status('saving','Sync pendente…');nsCloudScheduleRetry();return false}
+  try{const r=await fetchRemote();if(!r.exists||!r.state)return false;const ru=Date.parse(r.updatedAt||r.state.updatedAt||0)||0,lu=Date.parse(lastServerUpdatedAt||state.updatedAt||0)||0;if(force||ru>lu+200){const old=lastKnownServerState;state=normalize(nsMergeState(r.state,state,tombstoneSet(r.state,state),old));lastKnownServerState=structuredClone(r.state);lastServerUpdatedAt=r.updatedAt||r.state.updatedAt||'';try{localStorage.setItem(STORE,JSON.stringify(state))}catch(_){}if(typeof normalizeCoreState==='function')normalizeCoreState();if(typeof renderPage==='function')renderPage();setTimeout(()=>{try{nsAuditHydratePurchaseFrame()}catch(_){}},0);status('ok','Atualizado do banco');nsSyncLog('REFRESH_APPLIED',{revision:nsMetaRevision(r.state)});return true}status('ok','Sincronizado');return false}catch(e){window.__NSCloudLastError=e;if(e.status===401)status('error','Sessão expirada');else status('error','Sem conexão com o banco');return false}
+}
+async function nsRecoveryCandidates(){
+  const sync=Array.isArray(window.__NS_LOCAL_RECOVERY_FULL__)?window.__NS_LOCAL_RECOVERY_FULL__.slice():[];let idb=[];try{idb=await nsRecoveryIDBList()}catch(_){};const all=[...sync,...idb];const pend=readPending();if(pend&&typeof pend==='object')all.push({source:'pending',key:'ns_embalagens_pending_cloud_v1',state:pend,score:nsRecordCount(pend),updatedAt:Date.parse(pend.updatedAt||0)||Date.now(),bytes:nsSafeSize(pend)});all.sort((a,b)=>(Number(b.score)||0)-(Number(a.score)||0)||(Number(b.updatedAt)||0)-(Number(a.updatedAt)||0));window.__NS_RECOVERY_ALL__=all;return all
+}
+async function nsShowRecovery(){
+  const all=await nsRecoveryCandidates();let remote=null;try{remote=await fetchRemote()}catch(e){}
+  const remoteCount=remote?.state?nsRecordCount(remote.state):0,best=all[0]||null;
+  const lines=all.slice(0,8).map((c,i)=>`${i+1}. ${c.source}${c.key?' / '+c.key:''} · ${c.score||0} registros · ${c.updatedAt?new Date(c.updatedAt).toLocaleString('pt-BR'):'sem data'}`);
+  const msg=`RECUPERAÇÃO DE DADOS\n\nBanco atual: ${remoteCount} registros\nCópias encontradas: ${all.length}\n\n${lines.join('\n')||'Nenhuma cópia local encontrada.'}\n\nNenhuma cópia será gravada automaticamente.`;
+  if(!best){alert(msg+'\n\nSe os dados existiam antes e não há cópia local, a recuperação precisa vir de Backup/PITR do Supabase.');return false}
+  const choice=confirm(msg+`\n\nMelhor cópia: ${best.score||0} registros.\nOK = usar essa cópia NA TELA e preparar restauração.\nCancelar = não alterar nada.`);
+  if(!choice)return false;state=normalize(best.state);window.__NS_RECOVERY_SELECTED__=best;window.__NS_RECOVERY_LOCK__=true;try{localStorage.setItem(STORE,JSON.stringify(state))}catch(_){};try{nsRecoveryIDBPut(structuredClone(state),'manual-selected')}catch(_){};if(typeof renderPage==='function')renderPage();status('error',`Cópia selecionada: ${best.score||0} registros · banco ainda NÃO alterado`);
+  const restore=confirm(`A cópia de ${best.score||0} registros já está carregada na tela.\n\nDeseja RESTAURAR essa cópia no banco agora?\n\nSó confirme se os dados exibidos são os que você quer recuperar.`);if(!restore){nsRecoveryExportState(best.state,`ns-recuperacao-${new Date().toISOString().slice(0,10)}.json`);return true}
+  return nsRestoreSelectedRecovery()
+}
+async function nsRestoreSelectedRecovery(){
+  const c=window.__NS_RECOVERY_SELECTED__;if(!c?.state){alert('Nenhuma cópia de recuperação selecionada.');return false}
+  try{const remote=await fetchRemote();lastKnownServerState=remote?.state?structuredClone(remote.state):null;lastServerUpdatedAt=remote?.updatedAt||remote?.state?.updatedAt||'';state=normalize(c.state);window.__NS_RECOVERY_LOCK__=false;changeSeq=Math.max(changeSeq,Number(state?.__nsSync?.localSeq)||0)+1;pending=true;const snap=nsPrepareSnapshot(changeSeq);writePending(snap);try{nsRecoveryIDBPut(structuredClone(snap),'pre-restore')}catch(_){};const ok=await flush();if(!ok)throw new Error('O banco não confirmou a restauração.');const check=await fetchRemote();const cc=check?.state?nsRecordCount(check.state):0,lc=nsRecordCount(state);if(cc<Math.max(1,Math.floor(lc*.95)))throw new Error(`Conferência falhou: banco voltou com ${cc} registros e a cópia tinha ${lc}.`);window.__NS_RECOVERY_LOCK__=false;status('ok',`RECUPERADO · ${cc} registros confirmados no banco`);try{nsRecoveryIDBPut(structuredClone(check.state),'restored-confirmed')}catch(_){};alert(`Recuperação confirmada.\n\n${cc} registros foram relidos do banco após a gravação.`);return true}catch(e){window.__NS_RECOVERY_LOCK__=true;pending=true;try{writePending(state)}catch(_){};status('error','Restauração NÃO confirmada · dados locais preservados');alert('O banco NÃO foi considerado recuperado. A cópia local continua preservada.\n\n'+(e?.message||e));return false}
 }
 function logout(){setToken('');clearTimeout(saveTimer);clearTimeout(retryTimer);retryTimer=null;status('off','Desconectado')}
-window.NSCloud={login,bootstrap,queueSave,flush,refreshIfNewer,setToken,token,logout,status,savePending:writePending,forceSave:()=>flush(),payloadStats:()=>window.__NSCloudPayloadStats||null};
+window.NSCloud={login,bootstrap,queueSave,flush,refreshIfNewer,setToken,token,logout,status,savePending:writePending,forceSave:()=>flush(),payloadStats:()=>window.__NSCloudPayloadStats||null,diagnostics:nsDiagnostics,showDiagnostics:nsShowDiagnostics,testConnection:nsTestConnection,log:()=>syncEvents.slice(),recoveryCandidates:nsRecoveryCandidates,showRecovery:nsShowRecovery,restoreSelectedRecovery:nsRestoreSelectedRecovery};
 window.addEventListener('online',()=>{if(sessionStorage.getItem('ns_embalagens_access_role'))flush().catch(()=>{})});
 window.addEventListener('focus',()=>{if(sessionStorage.getItem('ns_embalagens_access_role')){if(readPending())flush().catch(()=>{});else refreshIfNewer(false)}});
 setInterval(()=>{if(sessionStorage.getItem('ns_embalagens_access_role')&&!document.hidden)refreshIfNewer(false)},45000);
-window.addEventListener('beforeunload',()=>{if(saveTimer&&token()){clearTimeout(saveTimer);try{try{nsAuditCapturePurchaseState(false)}catch(_){}const snapshot=structuredClone(state);snapshot.updatedAt=new Date().toISOString();writePending(snapshot);/* keepalive tem limite pequeno e não suporta a compactação assíncrona com segurança. Para bases pequenas ainda tenta; bases grandes ficam na fila local e o flush normal/online/focus envia compactado. */const raw=JSON.stringify({state:snapshot});if(raw.length<450000)fetch('/api/sync',{method:'POST',headers:{'Content-Type':'application/json'},body:raw,keepalive:true,credentials:'same-origin'}).then(r=>{if(r&&r.ok)clearPending()}).catch(()=>{})}catch(_){}}});
+window.addEventListener('beforeunload',()=>{
+  if(!window.__NS_RECOVERY_LOCK__&&(saveTimer||pending||changeSeq>lastConfirmedSeq)&&token()){
+    clearTimeout(saveTimer);try{try{nsAuditCapturePurchaseState(false)}catch(_){}const snapshot=structuredClone(state),meta=nsEnsureMeta(snapshot);snapshot.updatedAt=new Date().toISOString();meta.clientId=NS_CLIENT_ID;meta.localSeq=changeSeq;meta.updatedAtClient=snapshot.updatedAt;snapshot.__nsSync=meta;writePending(snapshot);nsSyncLog('BEFOREUNLOAD_PENDING',{seq:changeSeq});/* Não limpa a fila no beforeunload. O keepalive é apenas uma tentativa extra; a confirmação real ocorre no próximo GET/flush. */const raw=JSON.stringify({state:snapshot,expectedUpdatedAt:lastServerUpdatedAt||null,saveId:nsPendingSaveId(snapshot)||null,clientId:NS_CLIENT_ID});if(raw.length<400000)fetch('/api/sync',{method:'POST',headers:{'Content-Type':'application/json'},body:raw,keepalive:true,credentials:'same-origin'}).catch(()=>{})}catch(_){}}
+});
+
+function nsBindDiagButton(){const b=document.getElementById('btnDbDiag');if(b&&!b.dataset.boundDbDiag){b.dataset.boundDbDiag='1';b.addEventListener('click',()=>{nsShowDiagnostics();if(confirm('Executar agora um teste real de leitura/sincronização do banco?'))nsTestConnection()})}}
+function nsBindRecoveryButton(){const b=document.getElementById('btnRecovery');if(b&&!b.dataset.boundRecovery){b.dataset.boundRecovery='1';b.addEventListener('click',()=>nsShowRecovery())}}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',()=>{nsBindDiagButton();nsBindRecoveryButton()},{once:true});else{nsBindDiagButton();nsBindRecoveryButton()}
 })();
 </script>
 <script id="nsApprovedOrdersReplacement20260824">
@@ -11021,9 +11304,14 @@ function finRestoreLocalIfNewer(){
   try{
     const b=finLocalRead();if(!b)return false;
     const current=state.financeiro360&&typeof state.financeiro360==='object'?state.financeiro360:{};
-    const lt=Date.parse(b.updatedAt||b.data?.updatedAt||0)||0,ct=Date.parse(current.updatedAt||0)||0;
     const localNotes=Array.isArray(b.data?.notasEntrada)?b.data.notasEntrada.length:0,currentNotes=Array.isArray(current.notasEntrada)?current.notasEntrada.length:0;
-    if(lt>ct+50||(localNotes>0&&currentNotes===0&&ct===0)){state.financeiro360={...current,...structuredClone(b.data)};return true}
+    const localPay=Array.isArray(b.data?.contasPagarMP)?b.data.contasPagarMP.length:0,currentPay=Array.isArray(current.contasPagarMP)?current.contasPagarMP.length:0;
+    let diag=null;try{diag=window.NSCloud?.diagnostics?.()}catch(_){}
+    const cloudPending=!!diag?.pendingStored||!!diag?.saving||/offline|pendente|erro|sem conex/i.test(String(diag?.status||''));
+    const currentEmpty=currentNotes===0&&currentPay===0&&!current.updatedAt;
+    if(!currentEmpty&&!cloudPending)return false;
+    const lt=Date.parse(b.updatedAt||b.data?.updatedAt||0)||0,ct=Date.parse(current.updatedAt||0)||0;
+    if((currentEmpty&&(localNotes>0||localPay>0))||(cloudPending&&lt>ct+50)){state.financeiro360={...current,...structuredClone(b.data)};try{window.NSCloud?.savePending?.(structuredClone(state))}catch(_){}return true}
   }catch(e){console.warn('Financeiro: não foi possível restaurar backup local',e)}
   return false;
 }
